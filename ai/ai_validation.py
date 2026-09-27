@@ -41,6 +41,71 @@ def _is_financial_company(
     return any(keyword in text for keyword in FINANCIAL_KEYWORDS)
 
 
+def _historical_warnings(
+    data_quality: Dict,
+) -> List[str]:
+    """
+    Return explicit old-history warnings without turning them into
+    fundamental/company risk flags.
+
+    The market-data validator already distinguishes recent fatal gaps from
+    older degradable gaps. This helper only makes the older context visible in
+    the final shortlist JSON.
+    """
+    explicit = data_quality.get("historical_warnings")
+    if isinstance(explicit, list) and explicit:
+        return [str(item) for item in explicit]
+
+    warnings: List[str] = []
+
+    for gap in data_quality.get("older_large_daily_gaps", []) or []:
+        previous_daily = str(gap.get("previous_daily", "")).strip()
+        next_daily = str(gap.get("next_daily", "")).strip()
+        gap_days = gap.get("gap_days")
+
+        if gap_days is None:
+            continue
+
+        if previous_daily and next_daily:
+            warnings.append(
+                "Older Daily history gap: "
+                f"{previous_daily} -> {next_daily} "
+                f"({int(gap_days)} calendar days)."
+            )
+        else:
+            warnings.append(
+                f"Older Daily history contains a {int(gap_days)}-day gap."
+            )
+
+    if warnings:
+        return warnings
+
+    # Backward-compatible fallback for quality payloads that only expose the
+    # human-readable warnings list.
+    for warning in data_quality.get("warnings", []) or []:
+        text = str(warning)
+        if (
+            "Older Daily history" in text
+            or "historical" in text.lower()
+        ):
+            warnings.append(text)
+
+    return warnings
+
+
+def _candidate_reason_for_data_reject(
+    data_quality: Dict,
+) -> List[str]:
+    reasons = data_quality.get(
+        "reasons",
+        ["Unknown data-quality failure."],
+    )
+    return [
+        "Market data failed validation: " + str(reason)
+        for reason in reasons
+    ]
+
+
 def evaluate_candidate(
     symbol: str,
     fund_profile: Dict,
@@ -63,6 +128,8 @@ def evaluate_candidate(
     missing_data: List[str] = []
 
     data_quality = tech_profile.get("data_quality", {})
+    historical_warnings = _historical_warnings(data_quality)
+    historical_context_degraded = bool(historical_warnings)
 
     if not data_quality.get("valid", False):
         risks.extend(
@@ -81,6 +148,11 @@ def evaluate_candidate(
             "positive_evidence": positive,
             "risk_flags": risks,
             "missing_data": missing_data,
+            "historical_warnings": historical_warnings,
+            "historical_context_degraded": historical_context_degraded,
+            "candidate_eligibility_reason": _candidate_reason_for_data_reject(
+                data_quality
+            ),
             "financial_sector_model_deferred": False,
         }
 
@@ -227,11 +299,83 @@ def evaluate_candidate(
     else:
         decision = "WATCH"
 
+    candidate_eligibility_reason: List[str] = []
+
+    if decision == "CANDIDATE":
+        candidate_eligibility_reason.extend(
+            [
+                "Market data is valid and candidate-grade.",
+                "Daily trend is Bullish.",
+                "Bullish Daily/75m BOS/CHOCH evidence is present.",
+                "No bearish Daily BOS/CHOCH is present.",
+                "News/corporate-announcement evidence is available.",
+                "Generic non-financial fundamental model is applicable.",
+            ]
+        )
+    elif decision == "REJECT":
+        if sentiment == "Negative":
+            candidate_eligibility_reason.append(
+                "Rejected because a negative material event is present."
+            )
+
+        if (
+            not is_financial
+            and debt_to_equity is not None
+            and debt_to_equity > 3
+        ):
+            candidate_eligibility_reason.append(
+                "Rejected because debt to equity is above 3 for a "
+                "non-financial company."
+            )
+    else:
+        if not candidate_data_eligible:
+            blockers = data_quality.get("candidate_blockers", [])
+            if blockers:
+                candidate_eligibility_reason.extend(
+                    [
+                        "Market data is not candidate-grade: " + str(blocker)
+                        for blocker in blockers
+                    ]
+                )
+            else:
+                candidate_eligibility_reason.append(
+                    "Market data is usable for research but not "
+                    "candidate-grade."
+                )
+
+        if tech_profile.get("daily_trend") != "Bullish":
+            candidate_eligibility_reason.append(
+                "Daily trend is not Bullish."
+            )
+
+        if not bullish_structure_event:
+            candidate_eligibility_reason.append(
+                "No bullish Daily/75m BOS/CHOCH confirmation is present."
+            )
+
+        if bearish_daily:
+            candidate_eligibility_reason.append(
+                "Bearish Daily BOS/CHOCH is present."
+            )
+
+        if not event_available:
+            candidate_eligibility_reason.append(
+                "News/corporate-announcement evidence is unavailable."
+            )
+
+        if is_financial:
+            candidate_eligibility_reason.append(
+                "Dedicated financial-sector model is not implemented."
+            )
+
     return {
         "symbol": symbol,
         "decision": decision,
         "positive_evidence": positive,
         "risk_flags": risks,
         "missing_data": missing_data,
+        "historical_warnings": historical_warnings,
+        "historical_context_degraded": historical_context_degraded,
+        "candidate_eligibility_reason": candidate_eligibility_reason,
         "financial_sector_model_deferred": is_financial,
     }

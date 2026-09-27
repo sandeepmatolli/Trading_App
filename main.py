@@ -247,11 +247,20 @@ def main() -> None:
 
             results.append(result)
 
+            historical_warnings = result.get(
+                "historical_warnings",
+                [],
+            )
+
             print(
                 f"{symbol}: {result['decision']} | "
                 f"risks={len(result['risk_flags'])} | "
-                f"missing={len(result['missing_data'])}"
+                f"missing={len(result['missing_data'])} | "
+                f"historical_warnings={len(historical_warnings)}"
             )
+
+            for warning in historical_warnings:
+                print(f"  Historical data warning: {warning}")
 
         except Exception as exc:
             print(f"Failed processing {symbol}: {exc}")
@@ -263,6 +272,12 @@ def main() -> None:
                     "positive_evidence": [],
                     "risk_flags": [f"Pipeline error: {exc}"],
                     "missing_data": [],
+                    "historical_warnings": [],
+                    "historical_context_degraded": False,
+                    "candidate_eligibility_reason": [
+                        "Pipeline execution failed before candidate "
+                        "evaluation: " + str(exc)
+                    ],
                 }
             )
 
