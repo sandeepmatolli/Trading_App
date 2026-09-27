@@ -1,80 +1,216 @@
 # main.py
 
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Dict
+
+import pandas as pd
+
+from ai.ai_validation import evaluate_candidate
+from config import (
+    DEFAULT_DAILY_DAYS,
+    DEFAULT_FOUR_HOUR_DAYS,
+    DEFAULT_MAX_SYMBOLS,
+    DEFAULT_ONE_HOUR_DAYS,
+    OUTPUT_DIR,
+    SCREENER_CSV_PATH,
+    STRICT_CORE50_DEFAULT,
+    VALIDATED_CSV_PATH,
+)
 from fundamentals.csv_validator import validate_screener_csv
 from fundamentals.master_builder import update_company_master
 from fundamentals.screener_symbols import get_nse_symbols
-from market_data.groww_auth import get_groww_api
-from market_data.groww_fetch import fetch_candles
-from technical.smc_engine import detect_higher_tf_trend, detect_bullish_BOS, detect_bullish_CHOCH, find_order_blocks, find_fair_value_gaps
-from news.news_engine import fetch_nse_announcements, classify_event_text
-from ai.ai_validation import evaluate_candidate
-import pandas as pd
+from technical.smc_engine import build_technical_profile
 
-def main():
-    # 1. Validate Screener CSV
-    df_fund = validate_screener_csv("stocks_screen.csv")
 
-    # 2. Update company master
+def _fundamental_profile(row: pd.Series) -> Dict:
+    return {
+        "roce": row.get("Return on capital employed"),
+        "roe": row.get("Return on equity"),
+        "de_ratio": row.get("Debt to equity"),
+        "altman_z": row.get("Altman Z Score"),
+        "piotroski_score": row.get("Piotroski score"),
+        "pledged_percentage": row.get("Pledged percentage"),
+        "sales_growth_3y": row.get("Sales growth 3Years"),
+        "profit_growth_3y": row.get("Profit growth 3Years"),
+        "industry_group": row.get("Industry Group"),
+        "industry": row.get("Industry"),
+        "sector": row.get("Sector"),
+    }
+
+
+def _save_results(results) -> Path:
+    destination = OUTPUT_DIR / "shortlist.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(results, indent=2, default=str),
+        encoding="utf-8",
+    )
+    return destination
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="NSE swing-trading research pipeline"
+    )
+    parser.add_argument(
+        "--csv",
+        default=str(SCREENER_CSV_PATH),
+        help="Path to the Screener CSV export.",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Validate fundamentals and update company master only.",
+    )
+    parser.add_argument(
+        "--strict-core50",
+        action="store_true",
+        default=STRICT_CORE50_DEFAULT,
+        help="Fail when any agreed Core-50 field is missing.",
+    )
+    parser.add_argument(
+        "--max-symbols",
+        type=int,
+        default=DEFAULT_MAX_SYMBOLS,
+        help="Maximum number of NSE symbols to process with Groww.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+
+    df_fund = validate_screener_csv(
+        args.csv,
+        output_path=str(VALIDATED_CSV_PATH),
+        strict_core50=args.strict_core50,
+    )
+
     update_company_master(df_fund)
-    
-    # 3. Get list of NSE symbols
-    symbols = get_nse_symbols("fundamentals_validated.csv")
 
-    # 4. Initialize Groww API
+    symbols = get_nse_symbols(df_fund)
+    if args.validate_only:
+        print("Validation-only run completed successfully.")
+        return
+
+    if args.max_symbols <= 0:
+        raise ValueError("--max-symbols must be greater than zero.")
+
+    # Lazy import: validation-only mode does not need the Groww SDK.
+    from market_data.groww_auth import get_groww_api
+    from market_data.groww_fetch import fetch_candles, resample_ohlcv
+    from news.news_engine import (
+        event_profile_for_symbol,
+        fetch_nse_announcements,
+    )
+
     groww = get_groww_api()
+    announcements = fetch_nse_announcements()
 
-    shortlist = []
-    # 5. For each symbol, fetch data and analyze
-    for symbol in symbols:
+    indexed = (
+        df_fund.assign(
+            __nse=df_fund["NSE Code"].astype("string").str.strip().str.upper()
+        )
+        .dropna(subset=["__nse"])
+        .drop_duplicates(subset=["__nse"], keep="first")
+        .set_index("__nse")
+    )
+
+    results = []
+
+    for symbol in symbols[: args.max_symbols]:
+        print(f"\nProcessing {symbol} ...")
+
         try:
-            # 5a. Fetch price data
-            daily = fetch_candles(groww, symbol, interval_min=1440, days_back=365)
-            fourh = fetch_candles(groww, symbol, interval_min=240, days_back=90)
-            
-            # 5b. Technical signals
-            tech_profile = {
-                "daily_trend": detect_higher_tf_trend(daily),
-                "daily_bos": detect_bullish_BOS(daily),
-                "fourh_bos": detect_bullish_BOS(fourh),
-                "daily_choch": detect_bullish_CHOCH(daily),
-                "order_blocks": find_order_blocks(daily),
-                "fourh_liq_sweep": False,  # Placeholder: implement liquidity-sweep detection
-                "fourh_order_block": None, # Example, could pick last OB zone
-                "daily_FVG": find_fair_value_gaps(daily)
-            }
+            daily = fetch_candles(
+                groww,
+                symbol,
+                interval_min=1440,
+                days_back=DEFAULT_DAILY_DAYS,
+            )
+            four_hour = fetch_candles(
+                groww,
+                symbol,
+                interval_min=240,
+                days_back=DEFAULT_FOUR_HOUR_DAYS,
+            )
+            one_hour = fetch_candles(
+                groww,
+                symbol,
+                interval_min=60,
+                days_back=DEFAULT_ONE_HOUR_DAYS,
+            )
 
-            # 5c. Fundamental profile (placeholder values from df_fund)
-            # We map Screener columns to fund_profile dict
-            fund_row = df_fund[df_fund["NSE Code"] == symbol].iloc[0]
-            fund_profile = {
-                "roce": fund_row.get("Return on capital employed", 0),
-                "de_ratio": fund_row.get("Debt to equity", 0),
-                "altman_z": fund_row.get("Altman Z Score", 0),
-                "piotroski_score": fund_row.get("Piotroski score", 0)
-            }
+            if len(daily) < 30 or len(four_hour) < 30:
+                print(
+                    f"Skipping {symbol}: insufficient candle history "
+                    f"(daily={len(daily)}, 4H={len(four_hour)})."
+                )
+                continue
 
-            # 5d. News profile
-            # Check if symbol has any recent announcements (simple example)
-            announcements = fetch_nse_announcements()
-            ev = {"sentiment": "Neutral", "title": ""}
-            for ann in announcements:
-                if ann["symbol"] == symbol:
-                    typ, sent = classify_event_text(ann["title"])
-                    ev = {"sentiment": sent, "title": ann["title"]}
-                    break
+            weekly = resample_ohlcv(daily, "W-FRI")
+            monthly = resample_ohlcv(daily, "ME")
 
-            # 5e. Evaluate candidate
-            result = evaluate_candidate(symbol, fund_profile, tech_profile, ev)
-            if result["decision"] == "Buy":
-                shortlist.append((symbol, result["reasons"]))
+            tech_profile = build_technical_profile(
+                daily=daily,
+                four_hour=four_hour,
+                weekly=weekly,
+                monthly=monthly,
+                one_hour=one_hour,
+            )
 
-        except Exception as e:
-            print(f"Failed processing {symbol}: {e}")
+            fund_row = indexed.loc[symbol]
+            if isinstance(fund_row, pd.DataFrame):
+                fund_row = fund_row.iloc[0]
 
-    # 6. Output shortlist
-    print("Final Shortlist:")
-    for sym, reasons in shortlist:
-        print(f"{sym}: {'; '.join(reasons)}")
+            fund_profile = _fundamental_profile(fund_row)
+            event_profile = event_profile_for_symbol(
+                symbol,
+                announcements,
+            )
+
+            result = evaluate_candidate(
+                symbol,
+                fund_profile,
+                tech_profile,
+                event_profile,
+            )
+            result["technical_profile"] = tech_profile
+            result["event_profile"] = event_profile
+            results.append(result)
+
+            print(
+                f"{symbol}: {result['decision']} | "
+                f"risks={len(result['risk_flags'])} | "
+                f"missing={len(result['missing_data'])}"
+            )
+
+        except Exception as exc:
+            print(f"Failed processing {symbol}: {exc}")
+
+    destination = _save_results(results)
+
+    candidates = [
+        item for item in results
+        if item.get("decision") == "CANDIDATE"
+    ]
+
+    print("\nFinal research shortlist:")
+    if not candidates:
+        print("No CANDIDATE setups in this run.")
+    else:
+        for item in candidates:
+            print(
+                f"- {item['symbol']}: "
+                + "; ".join(item["positive_evidence"])
+            )
+
+    print(f"Full run output saved to: {destination}")
+
 
 if __name__ == "__main__":
     main()

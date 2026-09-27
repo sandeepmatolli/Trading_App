@@ -1,0 +1,38 @@
+# Python virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+
+# Python cache / test cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Secrets / local configuration
+.env
+.env.*
+!.env.example
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated data
+data/
+fundamentals_validated.csv
+
+# Screener Pro raw exports should remain local
+stocks_screen.csv
+all-stocks*.csv
+query-results*.csv
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

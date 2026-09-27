@@ -1,0 +1,6 @@
+feedparser==6.0.12
+growwapi==1.5.0
+numpy==2.0.2
+pandas==2.3.3
+pytest==8.4.2
+tzdata==2026.4
