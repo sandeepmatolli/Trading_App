@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 
 
 REQUIRED_OHLC = {"open", "high", "low", "close"}
 
 
-def _validate_ohlc(df: pd.DataFrame, minimum_rows: int = 3) -> pd.DataFrame:
+def _validate_ohlc(
+    df: pd.DataFrame,
+    minimum_rows: int = 3,
+) -> pd.DataFrame:
     missing = REQUIRED_OHLC - set(df.columns)
     if missing:
         raise ValueError(f"Missing OHLC columns: {sorted(missing)}")
@@ -22,18 +24,24 @@ def _validate_ohlc(df: pd.DataFrame, minimum_rows: int = 3) -> pd.DataFrame:
         )
 
     work = df.copy()
-    for col in ["open", "high", "low", "close", "volume"]:
+    for col in ("open", "high", "low", "close", "volume"):
         if col in work.columns:
             work[col] = pd.to_numeric(work[col], errors="coerce")
 
-    work = work.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    work = work.dropna(
+        subset=["open", "high", "low", "close"]
+    ).reset_index(drop=True)
+
     if len(work) < minimum_rows:
         raise ValueError("Not enough valid OHLC candles after cleaning.")
 
     return work
 
 
-def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+def calculate_atr(
+    df: pd.DataFrame,
+    period: int = 14,
+) -> pd.Series:
     work = _validate_ohlc(df, minimum_rows=2)
 
     previous_close = work["close"].shift(1)
@@ -59,10 +67,9 @@ def confirmed_swings(
     right: int = 2,
 ) -> pd.DataFrame:
     """
-    Confirm non-repainting pivot highs/lows.
+    Non-repainting pivot highs/lows.
 
-    A pivot at row i is only knowable after `right` later candles close.
-    The returned `known_at_index` records that confirmation point.
+    A pivot at index i is only knowable after `right` later candles close.
     """
     if left < 1 or right < 1:
         raise ValueError("left and right must both be >= 1.")
@@ -78,10 +85,7 @@ def confirmed_swings(
         high_window = work["high"].iloc[i - left : i + right + 1]
         low_window = work["low"].iloc[i - left : i + right + 1]
 
-        is_high = work["high"].iloc[i] == high_window.max()
-        is_low = work["low"].iloc[i] == low_window.min()
-
-        if is_high:
+        if work["high"].iloc[i] == high_window.max():
             records.append(
                 {
                     "pivot_index": i,
@@ -90,7 +94,8 @@ def confirmed_swings(
                     "price": float(work["high"].iloc[i]),
                 }
             )
-        if is_low:
+
+        if work["low"].iloc[i] == low_window.min():
             records.append(
                 {
                     "pivot_index": i,
@@ -102,7 +107,12 @@ def confirmed_swings(
 
     return pd.DataFrame(
         records,
-        columns=["pivot_index", "known_at_index", "type", "price"],
+        columns=[
+            "pivot_index",
+            "known_at_index",
+            "type",
+            "price",
+        ],
     )
 
 
@@ -116,7 +126,9 @@ def _known_swings_before_last(
         return swings
 
     last_index = len(df) - 1
-    return swings[swings["known_at_index"] <= last_index - 1]
+    return swings[
+        swings["known_at_index"] <= last_index - 1
+    ]
 
 
 def detect_higher_tf_trend(
@@ -124,8 +136,16 @@ def detect_higher_tf_trend(
     left: int = 2,
     right: int = 2,
 ) -> str:
-    work = _validate_ohlc(df, minimum_rows=left + right + 3)
-    swings = confirmed_swings(work, left=left, right=right)
+    work = _validate_ohlc(
+        df,
+        minimum_rows=left + right + 3,
+    )
+
+    swings = confirmed_swings(
+        work,
+        left=left,
+        right=right,
+    )
 
     highs = swings[swings["type"] == "high"].tail(2)
     lows = swings[swings["type"] == "low"].tail(2)
@@ -133,13 +153,17 @@ def detect_higher_tf_trend(
     if len(highs) < 2 or len(lows) < 2:
         return "Neutral"
 
-    high_1, high_2 = highs["price"].iloc[-2], highs["price"].iloc[-1]
-    low_1, low_2 = lows["price"].iloc[-2], lows["price"].iloc[-1]
+    high_1 = float(highs["price"].iloc[-2])
+    high_2 = float(highs["price"].iloc[-1])
+    low_1 = float(lows["price"].iloc[-2])
+    low_2 = float(lows["price"].iloc[-1])
 
     if high_2 > high_1 and low_2 > low_1:
         return "Bullish"
+
     if high_2 < high_1 and low_2 < low_1:
         return "Bearish"
+
     return "Neutral"
 
 
@@ -148,8 +172,17 @@ def detect_bullish_BOS(
     left: int = 2,
     right: int = 2,
 ) -> bool:
-    work = _validate_ohlc(df, minimum_rows=left + right + 3)
-    swings = _known_swings_before_last(work, left=left, right=right)
+    work = _validate_ohlc(
+        df,
+        minimum_rows=left + right + 3,
+    )
+
+    swings = _known_swings_before_last(
+        work,
+        left=left,
+        right=right,
+    )
+
     highs = swings[swings["type"] == "high"]
     if highs.empty:
         return False
@@ -166,8 +199,17 @@ def detect_bearish_BOS(
     left: int = 2,
     right: int = 2,
 ) -> bool:
-    work = _validate_ohlc(df, minimum_rows=left + right + 3)
-    swings = _known_swings_before_last(work, left=left, right=right)
+    work = _validate_ohlc(
+        df,
+        minimum_rows=left + right + 3,
+    )
+
+    swings = _known_swings_before_last(
+        work,
+        left=left,
+        right=right,
+    )
+
     lows = swings[swings["type"] == "low"]
     if lows.empty:
         return False
@@ -184,16 +226,24 @@ def detect_bullish_CHOCH(
     left: int = 2,
     right: int = 2,
 ) -> bool:
-    work = _validate_ohlc(df, minimum_rows=left + right + 6)
+    work = _validate_ohlc(
+        df,
+        minimum_rows=left + right + 6,
+    )
+
     prior_trend = detect_higher_tf_trend(
         work.iloc[:-1].reset_index(drop=True),
         left=left,
         right=right,
     )
-    return prior_trend == "Bearish" and detect_bullish_BOS(
-        work,
-        left=left,
-        right=right,
+
+    return (
+        prior_trend == "Bearish"
+        and detect_bullish_BOS(
+            work,
+            left=left,
+            right=right,
+        )
     )
 
 
@@ -202,16 +252,24 @@ def detect_bearish_CHOCH(
     left: int = 2,
     right: int = 2,
 ) -> bool:
-    work = _validate_ohlc(df, minimum_rows=left + right + 6)
+    work = _validate_ohlc(
+        df,
+        minimum_rows=left + right + 6,
+    )
+
     prior_trend = detect_higher_tf_trend(
         work.iloc[:-1].reset_index(drop=True),
         left=left,
         right=right,
     )
-    return prior_trend == "Bullish" and detect_bearish_BOS(
-        work,
-        left=left,
-        right=right,
+
+    return (
+        prior_trend == "Bullish"
+        and detect_bearish_BOS(
+            work,
+            left=left,
+            right=right,
+        )
     )
 
 
@@ -221,16 +279,23 @@ def detect_liquidity_sweep(
     right: int = 2,
 ) -> Optional[Dict]:
     """
-    Detect a sweep of the latest confirmed swing.
-
     Bullish sweep:
-      low trades below prior confirmed swing low, but candle closes back above it.
+      trades below latest confirmed swing low and closes back above it.
 
     Bearish sweep:
-      high trades above prior confirmed swing high, but candle closes back below it.
+      trades above latest confirmed swing high and closes back below it.
     """
-    work = _validate_ohlc(df, minimum_rows=left + right + 3)
-    swings = _known_swings_before_last(work, left=left, right=right)
+    work = _validate_ohlc(
+        df,
+        minimum_rows=left + right + 3,
+    )
+
+    swings = _known_swings_before_last(
+        work,
+        left=left,
+        right=right,
+    )
+
     if swings.empty:
         return None
 
@@ -239,7 +304,10 @@ def detect_liquidity_sweep(
     lows = swings[swings["type"] == "low"]
     if not lows.empty:
         level = float(lows.iloc[-1]["price"])
-        if float(candle["low"]) < level < float(candle["close"]):
+        if (
+            float(candle["low"]) < level
+            and float(candle["close"]) > level
+        ):
             return {
                 "direction": "bullish",
                 "level": level,
@@ -249,7 +317,10 @@ def detect_liquidity_sweep(
     highs = swings[swings["type"] == "high"]
     if not highs.empty:
         level = float(highs.iloc[-1]["price"])
-        if float(candle["high"]) > level > float(candle["close"]):
+        if (
+            float(candle["high"]) > level
+            and float(candle["close"]) < level
+        ):
             return {
                 "direction": "bearish",
                 "level": level,
@@ -264,13 +335,13 @@ def find_fair_value_gaps(
     min_gap: float = 0.0,
 ) -> List[Dict]:
     """
-    Detect three-candle Fair Value Gaps.
+    Three-candle FVG convention.
 
-    Bullish FVG at candle i:
-      low[i] > high[i-2]
+    Bullish:
+      candle 3 low > candle 1 high
 
-    Bearish FVG at candle i:
-      high[i] < low[i-2]
+    Bearish:
+      candle 3 high < candle 1 low
     """
     work = _validate_ohlc(df, minimum_rows=3)
     gaps: List[Dict] = []
@@ -279,7 +350,9 @@ def find_fair_value_gaps(
         first = work.iloc[i - 2]
         third = work.iloc[i]
 
-        bullish_size = float(third["low"] - first["high"])
+        bullish_size = float(
+            third["low"] - first["high"]
+        )
         if bullish_size > min_gap:
             gaps.append(
                 {
@@ -291,7 +364,9 @@ def find_fair_value_gaps(
                 }
             )
 
-        bearish_size = float(first["low"] - third["high"])
+        bearish_size = float(
+            first["low"] - third["high"]
+        )
         if bearish_size > min_gap:
             gaps.append(
                 {
@@ -313,26 +388,34 @@ def find_order_blocks(
     break_lookback: int = 5,
 ) -> List[Dict]:
     """
-    Find strict, testable order-block candidates.
+    Strict, deterministic order-block candidate convention.
 
-    Bullish candidate:
+    Bullish:
       - bearish candle
-      - next candle has bullish displacement
-      - next close breaks the prior `break_lookback` high
+      - next candle is bullish displacement
+      - next close breaks prior lookback high
 
-    Bearish candidate is the inverse.
-
-    This is one configurable convention, not a claim that all discretionary
-    SMC traders define order blocks identically.
+    Bearish is the inverse.
     """
     work = _validate_ohlc(
         df,
-        minimum_rows=max(atr_period + 2, break_lookback + 2),
+        minimum_rows=max(
+            atr_period + 2,
+            break_lookback + 2,
+        ),
     )
-    atr = calculate_atr(work, period=atr_period)
+
+    atr = calculate_atr(
+        work,
+        period=atr_period,
+    )
+
     blocks: List[Dict] = []
 
-    for i in range(break_lookback, len(work) - 1):
+    for i in range(
+        break_lookback,
+        len(work) - 1,
+    ):
         current = work.iloc[i]
         next_candle = work.iloc[i + 1]
         current_atr = atr.iloc[i + 1]
@@ -341,25 +424,37 @@ def find_order_blocks(
             continue
 
         next_body = abs(
-            float(next_candle["close"]) - float(next_candle["open"])
+            float(next_candle["close"])
+            - float(next_candle["open"])
         )
-        is_displacement = next_body >= float(current_atr) * displacement_atr
-        if not is_displacement:
+
+        if next_body < float(current_atr) * displacement_atr:
             continue
 
         prior_high = float(
-            work["high"].iloc[i - break_lookback : i].max()
+            work["high"].iloc[
+                i - break_lookback : i
+            ].max()
         )
         prior_low = float(
-            work["low"].iloc[i - break_lookback : i].min()
+            work["low"].iloc[
+                i - break_lookback : i
+            ].min()
         )
 
-        is_bearish_candle = float(current["close"]) < float(current["open"])
-        is_bullish_candle = float(current["close"]) > float(current["open"])
+        bearish_current = (
+            float(current["close"])
+            < float(current["open"])
+        )
+        bullish_current = (
+            float(current["close"])
+            > float(current["open"])
+        )
 
         if (
-            is_bearish_candle
-            and float(next_candle["close"]) > float(next_candle["open"])
+            bearish_current
+            and float(next_candle["close"])
+            > float(next_candle["open"])
             and float(next_candle["close"]) > prior_high
         ):
             blocks.append(
@@ -373,8 +468,9 @@ def find_order_blocks(
             )
 
         if (
-            is_bullish_candle
-            and float(next_candle["close"]) < float(next_candle["open"])
+            bullish_current
+            and float(next_candle["close"])
+            < float(next_candle["open"])
             and float(next_candle["close"]) < prior_low
         ):
             blocks.append(
@@ -390,50 +486,119 @@ def find_order_blocks(
     return blocks
 
 
+def _timeframe_profile(
+    df: pd.DataFrame,
+    prefix: str,
+) -> Dict:
+    if df is None or df.empty:
+        return {
+            f"{prefix}_trend": "InsufficientData",
+            f"{prefix}_bos_bullish": False,
+            f"{prefix}_bos_bearish": False,
+            f"{prefix}_choch_bullish": False,
+            f"{prefix}_choch_bearish": False,
+            f"{prefix}_liquidity_sweep": None,
+            f"{prefix}_fvgs": [],
+            f"{prefix}_order_blocks": [],
+        }
+
+    result: Dict = {}
+
+    try:
+        result[f"{prefix}_trend"] = detect_higher_tf_trend(df)
+    except ValueError:
+        result[f"{prefix}_trend"] = "InsufficientData"
+
+    for name, function in (
+        ("bos_bullish", detect_bullish_BOS),
+        ("bos_bearish", detect_bearish_BOS),
+        ("choch_bullish", detect_bullish_CHOCH),
+        ("choch_bearish", detect_bearish_CHOCH),
+    ):
+        try:
+            result[f"{prefix}_{name}"] = bool(function(df))
+        except ValueError:
+            result[f"{prefix}_{name}"] = False
+
+    try:
+        result[f"{prefix}_liquidity_sweep"] = detect_liquidity_sweep(df)
+    except ValueError:
+        result[f"{prefix}_liquidity_sweep"] = None
+
+    try:
+        result[f"{prefix}_fvgs"] = find_fair_value_gaps(df)[-5:]
+    except ValueError:
+        result[f"{prefix}_fvgs"] = []
+
+    try:
+        result[f"{prefix}_order_blocks"] = find_order_blocks(df)[-5:]
+    except ValueError:
+        result[f"{prefix}_order_blocks"] = []
+
+    return result
+
+
 def build_technical_profile(
     daily: pd.DataFrame,
-    four_hour: pd.DataFrame,
+    setup_75m: pd.DataFrame,
     weekly: Optional[pd.DataFrame] = None,
     monthly: Optional[pd.DataFrame] = None,
     one_hour: Optional[pd.DataFrame] = None,
+    data_quality: Optional[Dict] = None,
 ) -> Dict:
-    profile: Dict = {
-        "daily_trend": detect_higher_tf_trend(daily),
-        "daily_bos_bullish": detect_bullish_BOS(daily),
-        "daily_bos_bearish": detect_bearish_BOS(daily),
-        "daily_choch_bullish": detect_bullish_CHOCH(daily),
-        "daily_choch_bearish": detect_bearish_CHOCH(daily),
-        "daily_liquidity_sweep": detect_liquidity_sweep(daily),
-        "daily_fvgs": find_fair_value_gaps(daily)[-5:],
-        "daily_order_blocks": find_order_blocks(daily)[-5:],
-        "four_hour_trend": detect_higher_tf_trend(four_hour),
-        "four_hour_bos_bullish": detect_bullish_BOS(four_hour),
-        "four_hour_bos_bearish": detect_bearish_BOS(four_hour),
-        "four_hour_choch_bullish": detect_bullish_CHOCH(four_hour),
-        "four_hour_choch_bearish": detect_bearish_CHOCH(four_hour),
-        "four_hour_liquidity_sweep": detect_liquidity_sweep(four_hour),
-        "four_hour_fvgs": find_fair_value_gaps(four_hour)[-5:],
-        "four_hour_order_blocks": find_order_blocks(four_hour)[-5:],
+    """
+    Build deterministic SMC evidence.
+
+    V1 timeframe roles:
+      Monthly -> macro context
+      Weekly  -> primary swing structure
+      Daily   -> setup structure
+      75m     -> session-aligned refinement
+      1H      -> entry/near-term context
+    """
+    profile: Dict = {}
+
+    profile.update(
+        _timeframe_profile(
+            daily,
+            "daily",
+        )
+    )
+    profile.update(
+        _timeframe_profile(
+            setup_75m,
+            "setup_75m",
+        )
+    )
+
+    if weekly is not None:
+        profile.update(
+            _timeframe_profile(
+                weekly,
+                "weekly",
+            )
+        )
+
+    if monthly is not None:
+        profile.update(
+            _timeframe_profile(
+                monthly,
+                "monthly",
+            )
+        )
+
+    if one_hour is not None:
+        profile.update(
+            _timeframe_profile(
+                one_hour,
+                "one_hour",
+            )
+        )
+
+    profile["data_quality"] = data_quality or {
+        "valid": True,
+        "reasons": [],
+        "warnings": [],
     }
-
-    if weekly is not None and not weekly.empty:
-        try:
-            profile["weekly_trend"] = detect_higher_tf_trend(weekly)
-        except ValueError:
-            profile["weekly_trend"] = "InsufficientData"
-
-    if monthly is not None and not monthly.empty:
-        try:
-            profile["monthly_trend"] = detect_higher_tf_trend(monthly)
-        except ValueError:
-            profile["monthly_trend"] = "InsufficientData"
-
-    if one_hour is not None and not one_hour.empty:
-        try:
-            profile["one_hour_trend"] = detect_higher_tf_trend(one_hour)
-            profile["one_hour_liquidity_sweep"] = detect_liquidity_sweep(one_hour)
-        except ValueError:
-            profile["one_hour_trend"] = "InsufficientData"
-            profile["one_hour_liquidity_sweep"] = None
 
     return profile

@@ -21,18 +21,32 @@ FINANCIAL_KEYWORDS = {
 def _number(value) -> Optional[float]:
     if value is None or pd.isna(value):
         return None
+
     try:
         return float(value)
     except (TypeError, ValueError):
         return None
 
 
-def _is_financial_company(fund_profile: Dict) -> bool:
+def _is_financial_company(
+    fund_profile: Dict,
+) -> bool:
     text = " ".join(
-        str(fund_profile.get(key, "") or "")
-        for key in ("industry", "industry_group", "sector")
+        str(
+            fund_profile.get(key, "")
+            or ""
+        )
+        for key in (
+            "industry",
+            "industry_group",
+            "sector",
+        )
     ).lower()
-    return any(keyword in text for keyword in FINANCIAL_KEYWORDS)
+
+    return any(
+        keyword in text
+        for keyword in FINANCIAL_KEYWORDS
+    )
 
 
 def evaluate_candidate(
@@ -44,40 +58,86 @@ def evaluate_candidate(
     """
     Cross-check independent evidence streams.
 
-    This function intentionally returns CANDIDATE/WATCH/REJECT rather than
-    placing or recommending an automatic order. Human approval remains required.
+    Decisions:
+      DATA_REJECT -> market data is not trustworthy enough for SMC
+      REJECT      -> explicit material/fundamental risk
+      CANDIDATE   -> complete evidence and bullish setup
+      WATCH       -> incomplete or not-yet-confirmed setup
+
+    This function does not place orders.
     """
     positive: List[str] = []
     risks: List[str] = []
     missing_data: List[str] = []
 
-    is_financial = _is_financial_company(fund_profile)
+    data_quality = tech_profile.get(
+        "data_quality",
+        {},
+    )
 
-    roce = _number(fund_profile.get("roce"))
-    debt_to_equity = _number(fund_profile.get("de_ratio"))
-    altman_z = _number(fund_profile.get("altman_z"))
-    piotroski = _number(fund_profile.get("piotroski_score"))
-    pledged = _number(fund_profile.get("pledged_percentage"))
+    if not data_quality.get("valid", False):
+        risks.extend(
+            [
+                "Market data: " + str(reason)
+                for reason in data_quality.get(
+                    "reasons",
+                    ["Unknown data-quality failure."],
+                )
+            ]
+        )
 
-    if roce is None:
-        missing_data.append("ROCE")
-    elif roce >= 15:
-        positive.append("ROCE >= 15%")
-    elif roce < 10 and not is_financial:
-        risks.append("ROCE < 10%")
+        return {
+            "symbol": symbol,
+            "decision": "DATA_REJECT",
+            "positive_evidence": positive,
+            "risk_flags": risks,
+            "missing_data": missing_data,
+            "financial_sector_model_deferred": False,
+        }
 
-    if debt_to_equity is None:
-        missing_data.append("Debt to equity")
-    elif not is_financial:
-        if debt_to_equity <= 1:
+    is_financial = _is_financial_company(
+        fund_profile
+    )
+
+    roce = _number(
+        fund_profile.get("roce")
+    )
+    debt_to_equity = _number(
+        fund_profile.get("de_ratio")
+    )
+    altman_z = _number(
+        fund_profile.get("altman_z")
+    )
+    piotroski = _number(
+        fund_profile.get("piotroski_score")
+    )
+    pledged = _number(
+        fund_profile.get("pledged_percentage")
+    )
+
+    if is_financial:
+        missing_data.append(
+            "Dedicated bank/NBFC/financial-sector model not implemented."
+        )
+    else:
+        if roce is None:
+            missing_data.append("ROCE")
+        elif roce >= 15:
+            positive.append("ROCE >= 15%")
+        elif roce < 10:
+            risks.append("ROCE < 10%")
+
+        if debt_to_equity is None:
+            missing_data.append("Debt to equity")
+        elif debt_to_equity <= 1:
             positive.append("Debt to equity <= 1")
         elif debt_to_equity > 2:
             risks.append("Debt to equity > 2")
 
-    if altman_z is None:
-        missing_data.append("Altman Z Score")
-    elif not is_financial and altman_z < 1.8:
-        risks.append("Altman Z Score < 1.8")
+        if altman_z is None:
+            missing_data.append("Altman Z Score")
+        elif altman_z < 1.8:
+            risks.append("Altman Z Score < 1.8")
 
     if piotroski is None:
         missing_data.append("Piotroski score")
@@ -87,60 +147,142 @@ def evaluate_candidate(
     if pledged is not None and pledged > 20:
         risks.append("Promoter pledge > 20%")
 
-    if tech_profile.get("monthly_trend") == "Bullish":
-        positive.append("Monthly structure bullish")
-
-    if tech_profile.get("weekly_trend") == "Bullish":
-        positive.append("Weekly structure bullish")
-
-    if tech_profile.get("daily_trend") == "Bullish":
-        positive.append("Daily structure bullish")
+    for timeframe, label in (
+        ("monthly", "Monthly"),
+        ("weekly", "Weekly"),
+        ("daily", "Daily"),
+        ("setup_75m", "75m"),
+        ("one_hour", "1H"),
+    ):
+        if tech_profile.get(
+            f"{timeframe}_trend"
+        ) == "Bullish":
+            positive.append(
+                f"{label} structure bullish"
+            )
 
     bullish_structure_event = bool(
-        tech_profile.get("daily_bos_bullish")
-        or tech_profile.get("daily_choch_bullish")
-        or tech_profile.get("four_hour_bos_bullish")
-        or tech_profile.get("four_hour_choch_bullish")
+        tech_profile.get(
+            "daily_bos_bullish"
+        )
+        or tech_profile.get(
+            "daily_choch_bullish"
+        )
+        or tech_profile.get(
+            "setup_75m_bos_bullish"
+        )
+        or tech_profile.get(
+            "setup_75m_choch_bullish"
+        )
     )
+
     if bullish_structure_event:
-        positive.append("Bullish BOS/CHOCH evidence")
+        positive.append(
+            "Bullish BOS/CHOCH evidence"
+        )
 
-    sweep = tech_profile.get("four_hour_liquidity_sweep")
-    if sweep and sweep.get("direction") == "bullish":
-        positive.append("4H bullish liquidity sweep")
+    sweep = tech_profile.get(
+        "setup_75m_liquidity_sweep"
+    )
 
-    if tech_profile.get("daily_bos_bearish"):
-        risks.append("Daily bearish BOS")
-    if tech_profile.get("daily_choch_bearish"):
-        risks.append("Daily bearish CHOCH")
+    if (
+        sweep
+        and sweep.get("direction")
+        == "bullish"
+    ):
+        positive.append(
+            "75m bullish liquidity sweep"
+        )
 
-    sentiment = event_profile.get("sentiment", "Neutral")
+    if tech_profile.get(
+        "daily_bos_bearish"
+    ):
+        risks.append(
+            "Daily bearish BOS"
+        )
+
+    if tech_profile.get(
+        "daily_choch_bearish"
+    ):
+        risks.append(
+            "Daily bearish CHOCH"
+        )
+
+    event_available = bool(
+        event_profile.get(
+            "available",
+            False,
+        )
+    )
+
+    if not event_available:
+        missing_data.append(
+            "News/corporate-announcement source unavailable."
+        )
+        sentiment = "Unknown"
+    else:
+        sentiment = event_profile.get(
+            "sentiment",
+            "Neutral",
+        )
+
     if sentiment == "Negative":
         risks.append(
             "Negative material event: "
-            + str(event_profile.get("title", "")).strip()
+            + str(
+                event_profile.get(
+                    "title",
+                    "",
+                )
+            ).strip()
         )
     elif sentiment == "Positive":
         positive.append(
             "Positive corporate-development event: "
-            + str(event_profile.get("title", "")).strip()
+            + str(
+                event_profile.get(
+                    "title",
+                    "",
+                )
+            ).strip()
         )
 
-    hard_reject = sentiment == "Negative" or (
-        not is_financial
-        and debt_to_equity is not None
-        and debt_to_equity > 3
+    hard_reject = (
+        sentiment == "Negative"
+        or (
+            not is_financial
+            and debt_to_equity is not None
+            and debt_to_equity > 3
+        )
+    )
+
+    bearish_daily = bool(
+        tech_profile.get(
+            "daily_bos_bearish"
+        )
+        or tech_profile.get(
+            "daily_choch_bearish"
+        )
+    )
+
+    bullish_context = (
+        tech_profile.get(
+            "daily_trend"
+        ) == "Bullish"
+        and bullish_structure_event
+        and not bearish_daily
+    )
+
+    evidence_complete = (
+        event_available
+        and not is_financial
     )
 
     if hard_reject:
         decision = "REJECT"
     elif (
-        tech_profile.get("daily_trend") == "Bullish"
-        and bullish_structure_event
-        and not any(
-            item in risks
-            for item in ("Daily bearish BOS", "Daily bearish CHOCH")
-        )
+        bullish_context
+        and evidence_complete
     ):
         decision = "CANDIDATE"
     else:
@@ -154,30 +296,3 @@ def evaluate_candidate(
         "missing_data": missing_data,
         "financial_sector_model_deferred": is_financial,
     }
-
-
-if __name__ == "__main__":
-    result = evaluate_candidate(
-        "EXAMPLE",
-        {
-            "roce": 18,
-            "de_ratio": 0.4,
-            "altman_z": 3.1,
-            "piotroski_score": 8,
-            "pledged_percentage": 0,
-            "industry": "Industrials",
-        },
-        {
-            "weekly_trend": "Bullish",
-            "daily_trend": "Bullish",
-            "daily_bos_bullish": True,
-            "daily_choch_bullish": False,
-            "four_hour_bos_bullish": True,
-            "four_hour_choch_bullish": False,
-            "four_hour_liquidity_sweep": None,
-            "daily_bos_bearish": False,
-            "daily_choch_bearish": False,
-        },
-        {"sentiment": "Neutral", "title": ""},
-    )
-    print(result)

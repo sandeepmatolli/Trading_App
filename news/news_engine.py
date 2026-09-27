@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List, Tuple
 
 import feedparser
 
@@ -43,9 +43,6 @@ NEUTRAL_EVENT_WORDS = {
 def classify_event_text(title: str) -> Tuple[str, str]:
     """
     Conservative rule-based classification.
-
-    Corporate actions such as dividend/bonus are not automatically labelled
-    positive because price adjusts and context matters.
     """
     text = str(title or "").strip().lower()
 
@@ -61,34 +58,48 @@ def classify_event_text(title: str) -> Tuple[str, str]:
     return "General", "Neutral"
 
 
-def fetch_nse_announcements() -> List[Dict]:
+def fetch_nse_announcements() -> Dict:
     """
-    Optional RSS adapter.
+    Optional feed adapter.
 
-    NSE's corporate-filings webpage is the preferred primary source for the
-    application design, but this module does not hard-code an undocumented NSE
-    API endpoint. If NEWS_RSS_URLS is configured, those feeds are parsed here.
-
-    With no configured feeds the function safely returns an empty list.
+    This function deliberately does not pretend that "no configured feed"
+    means "no news". It returns an explicit availability flag.
     """
     if not NEWS_RSS_URLS:
         print(
-            "News: no RSS feed configured. Continuing with neutral event "
-            "context. Configure NEWS_RSS_URLS later or add a dedicated "
-            "NSE/BSE filing provider."
+            "News: no source configured. Event evidence will be marked "
+            "UNAVAILABLE, not Neutral."
         )
-        return []
+        return {
+            "available": False,
+            "items": [],
+            "errors": ["No NEWS_RSS_URLS configured."],
+        }
 
     announcements: List[Dict] = []
+    errors: List[str] = []
+    successful_sources = 0
 
     for url in NEWS_RSS_URLS:
         feed = feedparser.parse(url)
+
+        if getattr(feed, "bozo", False):
+            errors.append(
+                f"Feed parse problem for {url}: "
+                f"{getattr(feed, 'bozo_exception', 'unknown error')}"
+            )
+            continue
+
+        successful_sources += 1
 
         for entry in getattr(feed, "entries", []):
             title = str(entry.get("title", "")).strip()
             link = str(entry.get("link", "")).strip()
             published = str(
-                entry.get("published", entry.get("updated", ""))
+                entry.get(
+                    "published",
+                    entry.get("updated", ""),
+                )
             ).strip()
 
             symbol = ""
@@ -107,43 +118,74 @@ def fetch_nse_announcements() -> List[Dict]:
                 }
             )
 
-    return announcements
+    return {
+        "available": successful_sources > 0,
+        "items": announcements,
+        "errors": errors,
+    }
 
 
 def event_profile_for_symbol(
     symbol: str,
-    announcements: Iterable[Dict],
+    feed_result: Dict,
 ) -> Dict:
     symbol = str(symbol).strip().upper()
+
+    available = bool(feed_result.get("available", False))
+    items = list(feed_result.get("items", []))
+
+    if not available:
+        return {
+            "available": False,
+            "sentiment": "Unknown",
+            "event_type": "Unavailable",
+            "title": "",
+            "source": "",
+            "event_count": 0,
+            "errors": list(feed_result.get("errors", [])),
+        }
+
     matches = [
         item
-        for item in announcements
+        for item in items
         if str(item.get("symbol", "")).strip().upper() == symbol
     ]
 
     if not matches:
         return {
+            "available": True,
             "sentiment": "Neutral",
-            "event_type": "None",
+            "event_type": "NoneFound",
             "title": "",
             "source": "",
             "event_count": 0,
+            "errors": list(feed_result.get("errors", [])),
         }
 
+    priority = {
+        "Negative": 3,
+        "Positive": 2,
+        "Neutral": 1,
+    }
+
     ranked = []
-    priority = {"Negative": 3, "Positive": 2, "Neutral": 1}
 
     for item in matches:
-        event_type, sentiment = classify_event_text(item.get("title", ""))
+        event_type, sentiment = classify_event_text(
+            item.get("title", "")
+        )
+
         ranked.append(
             (
                 priority[sentiment],
                 {
+                    "available": True,
                     "sentiment": sentiment,
                     "event_type": event_type,
                     "title": item.get("title", ""),
                     "source": item.get("source", ""),
                     "event_count": len(matches),
+                    "errors": list(feed_result.get("errors", [])),
                 },
             )
         )
@@ -153,5 +195,8 @@ def event_profile_for_symbol(
 
 
 if __name__ == "__main__":
-    items = fetch_nse_announcements()
-    print(f"Loaded {len(items)} configured-feed announcements.")
+    result = fetch_nse_announcements()
+    print(
+        f"News source available={result['available']} "
+        f"items={len(result['items'])}"
+    )
