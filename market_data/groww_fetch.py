@@ -868,9 +868,56 @@ def validate_market_data(
     if setup_history_days is None:
         setup_history_days = 89
 
-    setup_cutoff = now - pd.Timedelta(days=setup_history_days)
-    recent_daily = daily[daily["ts"] >= setup_cutoff].copy() if not daily.empty else daily
-    expected_setup_windows = int(len(recent_daily) * 5)
+    # Use the actual setup-data date span as the denominator reference, then
+    # union those dates with derived Daily sessions in the same span. This
+    # prevents ratios above 1.0 when the requested lookback cutoff falls
+    # intraday (for example, Daily bars are timestamped at midnight while the
+    # first returned 15m session starts later that same calendar day).
+    #
+    # The Daily dates still matter: if an entire intraday session is missing
+    # from the 15m feed but the Daily/1H data contains that trading date, its
+    # five expected 75m windows remain in the denominator.
+    setup_reference_dates = set()
+
+    if not setup_75m.empty:
+        setup_local_dates = (
+            setup_75m["ts"]
+            .dt.tz_convert(IST)
+            .dt.normalize()
+        )
+        setup_start_day = setup_local_dates.min()
+        setup_end_day = setup_local_dates.max()
+
+        setup_reference_dates.update(setup_local_dates.tolist())
+
+        if not daily.empty:
+            daily_local_dates = (
+                daily["ts"]
+                .dt.tz_convert(IST)
+                .dt.normalize()
+            )
+            in_setup_span = (
+                (daily_local_dates >= setup_start_day)
+                & (daily_local_dates <= setup_end_day)
+            )
+            setup_reference_dates.update(
+                daily_local_dates[in_setup_span].tolist()
+            )
+    elif not daily.empty:
+        setup_cutoff_day = (
+            now - pd.Timedelta(days=setup_history_days)
+        ).normalize()
+        daily_local_dates = (
+            daily["ts"]
+            .dt.tz_convert(IST)
+            .dt.normalize()
+        )
+        setup_reference_dates.update(
+            daily_local_dates[daily_local_dates >= setup_cutoff_day].tolist()
+        )
+
+    expected_setup_sessions = len(setup_reference_dates)
+    expected_setup_windows = int(expected_setup_sessions * 5)
 
     usable_setup_bars = 0
     if not setup_75m.empty:
@@ -979,6 +1026,7 @@ def validate_market_data(
         "daily_rows": daily_count,
         "setup_75m_rows": setup_count,
         "setup_75m_usable_rows": usable_setup_bars,
+        "expected_setup_sessions": expected_setup_sessions,
         "expected_setup_75m_windows": expected_setup_windows,
         "setup_75m_window_coverage_ratio": round(setup_window_coverage_ratio, 4),
         "setup_75m_usable_expected_ratio": round(setup_usable_expected_ratio, 4),

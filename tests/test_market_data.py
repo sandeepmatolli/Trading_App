@@ -203,7 +203,38 @@ def test_good_recent_data_is_candidate_eligible():
     assert quality["candidate_eligible"] is True
     assert quality["source_15m_marker_rows"] == 20
     assert quality["setup_75m_usable_rows"] == 100
+    assert quality["expected_setup_sessions"] == 20
+    assert quality["expected_setup_75m_windows"] == 100
+    assert quality["setup_75m_window_coverage_ratio"] == 1.0
+    assert quality["setup_75m_usable_expected_ratio"] == 1.0
 
+
+
+def test_setup_ratios_never_exceed_one_when_requested_cutoff_is_shorter_than_observed_setup_span():
+    hourly = _hourly_fixture(days=80)
+    daily = build_daily_from_hourly(hourly)
+    fifteen = _fifteen_minute_fixture(days=20)
+    setup = build_session_75m_from_15m(fifteen)
+
+    # Deliberately pass a shorter nominal lookback than the observed setup
+    # frame. The denominator must be derived from the actual setup span plus
+    # Daily session dates, not from an intraday cutoff that can under-count the
+    # first session and produce impossible ratios above 1.0.
+    quality = validate_market_data(
+        hourly=hourly,
+        daily=daily,
+        setup_75m=setup,
+        requested_history_days=120,
+        fifteen_minute=fifteen,
+        setup_history_days=1,
+    )
+
+    assert quality["expected_setup_sessions"] == 20
+    assert quality["expected_setup_75m_windows"] == 100
+    assert quality["setup_75m_window_coverage_ratio"] == 1.0
+    assert quality["setup_75m_usable_expected_ratio"] == 1.0
+    assert quality["setup_75m_window_coverage_ratio"] <= 1.0
+    assert quality["setup_75m_usable_expected_ratio"] <= 1.0
 
 def test_low_75m_source_completeness_blocks_candidate():
     hourly = _hourly_fixture(days=80)
