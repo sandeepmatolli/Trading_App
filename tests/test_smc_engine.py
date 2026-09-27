@@ -1,5 +1,3 @@
-# tests/test_smc_engine.py
-
 import pandas as pd
 
 from technical.smc_engine import (
@@ -41,12 +39,60 @@ def test_no_false_adjacent_candle_fvg():
     assert gaps == []
 
 
+def test_75m_fvg_does_not_cross_missing_time_window():
+    df = pd.DataFrame(
+        {
+            "ts": pd.to_datetime(
+                [
+                    "2026-09-25 09:15:00+05:30",
+                    "2026-09-25 10:30:00+05:30",
+                    # 11:45 window is missing; next row jumps to 13:00.
+                    "2026-09-25 13:00:00+05:30",
+                ]
+            ),
+            "open": [100, 104, 111],
+            "high": [105, 112, 116],
+            "low": [99, 103, 108],
+            "close": [104, 111, 115],
+            "expected_interval_minutes": [75, 75, 75],
+        }
+    )
+
+    gaps = find_fair_value_gaps(df)
+
+    assert gaps == []
+
+
+def test_75m_fvg_is_allowed_when_three_bars_are_contiguous():
+    df = pd.DataFrame(
+        {
+            "ts": pd.to_datetime(
+                [
+                    "2026-09-25 09:15:00+05:30",
+                    "2026-09-25 10:30:00+05:30",
+                    "2026-09-25 11:45:00+05:30",
+                ]
+            ),
+            "open": [100, 104, 111],
+            "high": [105, 112, 116],
+            "low": [99, 103, 108],
+            "close": [104, 111, 115],
+            "expected_interval_minutes": [75, 75, 75],
+        }
+    )
+
+    gaps = find_fair_value_gaps(df)
+
+    bullish = [item for item in gaps if item["direction"] == "bullish"]
+    assert len(bullish) == 1
+
+
 def test_bullish_liquidity_sweep():
     df = pd.DataFrame(
         {
-            "open":  [105, 104, 103, 102, 103, 104, 103, 101],
-            "high":  [106, 105, 104, 103, 105, 106, 104, 104],
-            "low":   [103, 102, 100, 101, 102, 103, 102, 99],
+            "open": [105, 104, 103, 102, 103, 104, 103, 101],
+            "high": [106, 105, 104, 103, 105, 106, 104, 104],
+            "low": [103, 102, 100, 101, 102, 103, 102, 99],
             "close": [104, 103, 102, 102, 104, 105, 103, 102],
         }
     )

@@ -1,5 +1,3 @@
-# config.py
-
 from __future__ import annotations
 
 import os
@@ -29,8 +27,7 @@ def _get_int(name: str, default: int) -> int:
         return int(value.strip())
     except ValueError as exc:
         raise ValueError(
-            f"Environment variable {name} must be an integer. "
-            f"Received: {value!r}"
+            f"Environment variable {name} must be an integer. Received: {value!r}"
         ) from exc
 
 
@@ -42,8 +39,7 @@ def _get_float(name: str, default: float) -> float:
         return float(value.strip())
     except ValueError as exc:
         raise ValueError(
-            f"Environment variable {name} must be numeric. "
-            f"Received: {value!r}"
+            f"Environment variable {name} must be numeric. Received: {value!r}"
         ) from exc
 
 
@@ -108,89 +104,76 @@ RESULT_FRESHNESS_MONTHS = _get_int("RESULT_FRESHNESS_MONTHS", 4)
 # Market-data architecture
 # ---------------------------------------------------------------------------
 #
-# IMPORTANT:
-# We no longer use Groww's direct 1-day or direct 4-hour candles as the
-# authoritative SMC source.
+# V1 authoritative feeds:
+#   Groww 1H  -> derived Daily -> Weekly -> Monthly
+#   Groww 15m -> fixed, session-aligned 75m setup bars
 #
-# Observed API behaviour for 20MICRONS returned:
-#   - only one direct Daily candle for a 60-day request
-#   - irregular direct 4H timestamps
+# Direct Groww 1D / 4H are not used as the authoritative SMC source because
+# live testing showed incomplete/irregular responses for some symbols.
 #
-# V1 therefore uses:
-#   Groww 1H -> Daily -> Weekly -> Monthly
-#   Groww 15m -> session-aligned 75m setup candles
-#
-# 75 minutes divides the regular NSE cash session (375 minutes) exactly into
-# five bars, avoiding arbitrary 4H session boundaries.
+# The regular NSE cash session is 09:15-15:30 (375 minutes), so it divides
+# exactly into five 75-minute windows:
+#   09:15, 10:30, 11:45, 13:00, 14:15
 # ---------------------------------------------------------------------------
 
-DEFAULT_HOURLY_HISTORY_DAYS = _get_int(
-    "DEFAULT_HOURLY_HISTORY_DAYS",
-    730,
-)
+DEFAULT_HOURLY_HISTORY_DAYS = _get_int("DEFAULT_HOURLY_HISTORY_DAYS", 730)
+DEFAULT_SETUP_15M_DAYS = _get_int("DEFAULT_SETUP_15M_DAYS", 89)
+DEFAULT_MAX_SYMBOLS = _get_int("DEFAULT_MAX_SYMBOLS", 20)
 
-DEFAULT_SETUP_15M_DAYS = _get_int(
-    "DEFAULT_SETUP_15M_DAYS",
-    89,
-)
-
-DEFAULT_MAX_SYMBOLS = _get_int(
-    "DEFAULT_MAX_SYMBOLS",
-    20,
-)
-
-# Use smaller operational windows than Groww's documented maxima.
-# This is deliberate: the API accepted larger 1H windows in testing but
-# returned a silent 42-day hole for 20MICRONS. Smaller windows reduce the
-# chance of incomplete responses while keeping the documented limits intact.
+# Conservative operational windows below Groww's documented request maxima.
 GROWW_HOURLY_REQUEST_CHUNK_DAYS = _get_int(
     "GROWW_HOURLY_REQUEST_CHUNK_DAYS",
     60,
 )
-
 GROWW_15M_REQUEST_CHUNK_DAYS = _get_int(
     "GROWW_15M_REQUEST_CHUNK_DAYS",
     30,
 )
-
 GROWW_GAP_REPAIR_CHUNK_DAYS = _get_int(
     "GROWW_GAP_REPAIR_CHUNK_DAYS",
     14,
 )
-
 GROWW_GAP_REPAIR_MAX_PASSES = _get_int(
     "GROWW_GAP_REPAIR_MAX_PASSES",
     2,
 )
 
-NSE_SESSION_START = os.getenv(
-    "NSE_SESSION_START",
-    "09:15",
-).strip()
+NSE_SESSION_START = os.getenv("NSE_SESSION_START", "09:15").strip()
+NSE_SESSION_END = os.getenv("NSE_SESSION_END", "15:30").strip()
 
-NSE_SESSION_END = os.getenv(
-    "NSE_SESSION_END",
-    "15:30",
-).strip()
-
-MARKET_DATA_MAX_AGE_DAYS = _get_int(
-    "MARKET_DATA_MAX_AGE_DAYS",
-    7,
-)
-
+# Fatal/current-data gates.
+MARKET_DATA_MAX_AGE_DAYS = _get_int("MARKET_DATA_MAX_AGE_DAYS", 7)
 MARKET_DATA_MAX_DAILY_GAP_DAYS = _get_int(
     "MARKET_DATA_MAX_DAILY_GAP_DAYS",
     14,
 )
-
+MARKET_DATA_RECENT_CONTINUITY_DAYS = _get_int(
+    "MARKET_DATA_RECENT_CONTINUITY_DAYS",
+    365,
+)
 MARKET_DATA_MIN_DAILY_COVERAGE_RATIO = _get_float(
     "MARKET_DATA_MIN_DAILY_COVERAGE_RATIO",
     0.55,
 )
 
+# 75m setup-bar quality. Bars are never fabricated. A 75m window is built
+# from the real 15m candles returned inside that fixed window. source_bars
+# records how many of the five expected 15m candles were present.
+MARKET_DATA_SETUP_MIN_SOURCE_BARS = _get_int(
+    "MARKET_DATA_SETUP_MIN_SOURCE_BARS",
+    3,
+)
 MARKET_DATA_MIN_SETUP_BARS = _get_int(
     "MARKET_DATA_MIN_SETUP_BARS",
-    20,
+    80,
+)
+MARKET_DATA_MIN_SETUP_USABLE_EXPECTED_RATIO = _get_float(
+    "MARKET_DATA_MIN_SETUP_USABLE_EXPECTED_RATIO",
+    0.40,
+)
+MARKET_DATA_CANDIDATE_SETUP_USABLE_EXPECTED_RATIO = _get_float(
+    "MARKET_DATA_CANDIDATE_SETUP_USABLE_EXPECTED_RATIO",
+    0.65,
 )
 
 
@@ -232,3 +215,6 @@ if __name__ == "__main__":
     print("1H request chunk days:", GROWW_HOURLY_REQUEST_CHUNK_DAYS)
     print("15m request chunk days:", GROWW_15M_REQUEST_CHUNK_DAYS)
     print("Gap-repair chunk days:", GROWW_GAP_REPAIR_CHUNK_DAYS)
+    print("Recent continuity days:", MARKET_DATA_RECENT_CONTINUITY_DAYS)
+    print("75m minimum source bars:", MARKET_DATA_SETUP_MIN_SOURCE_BARS)
+    print("75m minimum usable bars:", MARKET_DATA_MIN_SETUP_BARS)

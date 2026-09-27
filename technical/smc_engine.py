@@ -1,5 +1,3 @@
-# technical/smc_engine.py
-
 from __future__ import annotations
 
 from typing import Dict, List, Optional
@@ -36,6 +34,61 @@ def _validate_ohlc(
         raise ValueError("Not enough valid OHLC candles after cleaning.")
 
     return work
+
+
+def _expected_interval_minutes(df: pd.DataFrame) -> Optional[int]:
+    if "expected_interval_minutes" not in df.columns:
+        return None
+
+    values = pd.to_numeric(
+        df["expected_interval_minutes"],
+        errors="coerce",
+    ).dropna()
+
+    if values.empty:
+        return None
+
+    unique = sorted(set(int(value) for value in values if value > 0))
+    if len(unique) != 1:
+        return None
+    return unique[0]
+
+
+def _bars_are_time_contiguous(
+    df: pd.DataFrame,
+    start_index: int,
+    end_index: int,
+) -> bool:
+    """
+    Protect interval-sensitive patterns from crossing missing candles.
+
+    If a frame has `expected_interval_minutes`, consecutive rows used by an
+    FVG/order-block pattern must be exactly that far apart. Frames without
+    this metadata retain the original behaviour.
+    """
+    interval_minutes = _expected_interval_minutes(df)
+    if interval_minutes is None or "ts" not in df.columns:
+        return True
+
+    if start_index < 0 or end_index >= len(df) or start_index >= end_index:
+        return False
+
+    timestamps = pd.to_datetime(
+        df["ts"],
+        errors="coerce",
+    )
+
+    expected_seconds = interval_minutes * 60
+    for index in range(start_index + 1, end_index + 1):
+        previous = timestamps.iloc[index - 1]
+        current = timestamps.iloc[index]
+        if pd.isna(previous) or pd.isna(current):
+            return False
+        delta_seconds = (current - previous).total_seconds()
+        if delta_seconds != expected_seconds:
+            return False
+
+    return True
 
 
 def calculate_atr(
@@ -342,17 +395,21 @@ def find_fair_value_gaps(
 
     Bearish:
       candle 3 high < candle 1 low
+
+    When interval metadata is present, FVGs are not allowed to cross missing
+    75m/1H buckets or overnight session gaps.
     """
     work = _validate_ohlc(df, minimum_rows=3)
     gaps: List[Dict] = []
 
     for i in range(2, len(work)):
+        if not _bars_are_time_contiguous(work, i - 2, i):
+            continue
+
         first = work.iloc[i - 2]
         third = work.iloc[i]
 
-        bullish_size = float(
-            third["low"] - first["high"]
-        )
+        bullish_size = float(third["low"] - first["high"])
         if bullish_size > min_gap:
             gaps.append(
                 {
@@ -364,9 +421,7 @@ def find_fair_value_gaps(
                 }
             )
 
-        bearish_size = float(
-            first["low"] - third["high"]
-        )
+        bearish_size = float(first["low"] - third["high"])
         if bearish_size > min_gap:
             gaps.append(
                 {
@@ -396,6 +451,9 @@ def find_order_blocks(
       - next close breaks prior lookback high
 
     Bearish is the inverse.
+
+    If interval metadata exists, the current and displacement candles must be
+    time-contiguous so a missing source bucket cannot manufacture an OB.
     """
     work = _validate_ohlc(
         df,
@@ -416,6 +474,9 @@ def find_order_blocks(
         break_lookback,
         len(work) - 1,
     ):
+        if not _bars_are_time_contiguous(work, i, i + 1):
+            continue
+
         current = work.iloc[i]
         next_candle = work.iloc[i + 1]
         current_atr = atr.iloc[i + 1]
@@ -442,19 +503,12 @@ def find_order_blocks(
             ].min()
         )
 
-        bearish_current = (
-            float(current["close"])
-            < float(current["open"])
-        )
-        bullish_current = (
-            float(current["close"])
-            > float(current["open"])
-        )
+        bearish_current = float(current["close"]) < float(current["open"])
+        bullish_current = float(current["close"]) > float(current["open"])
 
         if (
             bearish_current
-            and float(next_candle["close"])
-            > float(next_candle["open"])
+            and float(next_candle["close"]) > float(next_candle["open"])
             and float(next_candle["close"]) > prior_high
         ):
             blocks.append(
@@ -469,8 +523,7 @@ def find_order_blocks(
 
         if (
             bullish_current
-            and float(next_candle["close"])
-            < float(next_candle["open"])
+            and float(next_candle["close"]) < float(next_candle["open"])
             and float(next_candle["close"]) < prior_low
         ):
             blocks.append(
@@ -597,8 +650,10 @@ def build_technical_profile(
 
     profile["data_quality"] = data_quality or {
         "valid": True,
+        "candidate_eligible": True,
         "reasons": [],
         "warnings": [],
+        "candidate_blockers": [],
     }
 
     return profile

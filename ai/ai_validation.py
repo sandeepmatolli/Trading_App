@@ -1,5 +1,3 @@
-# ai/ai_validation.py
-
 from __future__ import annotations
 
 from typing import Dict, List, Optional
@@ -32,10 +30,7 @@ def _is_financial_company(
     fund_profile: Dict,
 ) -> bool:
     text = " ".join(
-        str(
-            fund_profile.get(key, "")
-            or ""
-        )
+        str(fund_profile.get(key, "") or "")
         for key in (
             "industry",
             "industry_group",
@@ -43,10 +38,7 @@ def _is_financial_company(
         )
     ).lower()
 
-    return any(
-        keyword in text
-        for keyword in FINANCIAL_KEYWORDS
-    )
+    return any(keyword in text for keyword in FINANCIAL_KEYWORDS)
 
 
 def evaluate_candidate(
@@ -61,8 +53,8 @@ def evaluate_candidate(
     Decisions:
       DATA_REJECT -> market data is not trustworthy enough for SMC
       REJECT      -> explicit material/fundamental risk
-      CANDIDATE   -> complete evidence and bullish setup
-      WATCH       -> incomplete or not-yet-confirmed setup
+      CANDIDATE   -> complete evidence, candidate-grade data, bullish setup
+      WATCH       -> incomplete, degraded, or not-yet-confirmed setup
 
     This function does not place orders.
     """
@@ -70,10 +62,7 @@ def evaluate_candidate(
     risks: List[str] = []
     missing_data: List[str] = []
 
-    data_quality = tech_profile.get(
-        "data_quality",
-        {},
-    )
+    data_quality = tech_profile.get("data_quality", {})
 
     if not data_quality.get("valid", False):
         risks.extend(
@@ -95,25 +84,32 @@ def evaluate_candidate(
             "financial_sector_model_deferred": False,
         }
 
-    is_financial = _is_financial_company(
-        fund_profile
+    candidate_data_eligible = bool(
+        data_quality.get(
+            "candidate_eligible",
+            data_quality.get("valid", False),
+        )
     )
 
-    roce = _number(
-        fund_profile.get("roce")
-    )
-    debt_to_equity = _number(
-        fund_profile.get("de_ratio")
-    )
-    altman_z = _number(
-        fund_profile.get("altman_z")
-    )
-    piotroski = _number(
-        fund_profile.get("piotroski_score")
-    )
-    pledged = _number(
-        fund_profile.get("pledged_percentage")
-    )
+    if not candidate_data_eligible:
+        blockers = data_quality.get("candidate_blockers", [])
+        if blockers:
+            for blocker in blockers:
+                missing_data.append(
+                    "Market-data candidate gate: " + str(blocker)
+                )
+        else:
+            missing_data.append(
+                "Market data is usable for research but not candidate-grade."
+            )
+
+    is_financial = _is_financial_company(fund_profile)
+
+    roce = _number(fund_profile.get("roce"))
+    debt_to_equity = _number(fund_profile.get("de_ratio"))
+    altman_z = _number(fund_profile.get("altman_z"))
+    piotroski = _number(fund_profile.get("piotroski_score"))
+    pledged = _number(fund_profile.get("pledged_percentage"))
 
     if is_financial:
         missing_data.append(
@@ -154,66 +150,30 @@ def evaluate_candidate(
         ("setup_75m", "75m"),
         ("one_hour", "1H"),
     ):
-        if tech_profile.get(
-            f"{timeframe}_trend"
-        ) == "Bullish":
-            positive.append(
-                f"{label} structure bullish"
-            )
+        if tech_profile.get(f"{timeframe}_trend") == "Bullish":
+            positive.append(f"{label} structure bullish")
 
     bullish_structure_event = bool(
-        tech_profile.get(
-            "daily_bos_bullish"
-        )
-        or tech_profile.get(
-            "daily_choch_bullish"
-        )
-        or tech_profile.get(
-            "setup_75m_bos_bullish"
-        )
-        or tech_profile.get(
-            "setup_75m_choch_bullish"
-        )
+        tech_profile.get("daily_bos_bullish")
+        or tech_profile.get("daily_choch_bullish")
+        or tech_profile.get("setup_75m_bos_bullish")
+        or tech_profile.get("setup_75m_choch_bullish")
     )
 
     if bullish_structure_event:
-        positive.append(
-            "Bullish BOS/CHOCH evidence"
-        )
+        positive.append("Bullish BOS/CHOCH evidence")
 
-    sweep = tech_profile.get(
-        "setup_75m_liquidity_sweep"
-    )
+    sweep = tech_profile.get("setup_75m_liquidity_sweep")
+    if sweep and sweep.get("direction") == "bullish":
+        positive.append("75m bullish liquidity sweep")
 
-    if (
-        sweep
-        and sweep.get("direction")
-        == "bullish"
-    ):
-        positive.append(
-            "75m bullish liquidity sweep"
-        )
+    if tech_profile.get("daily_bos_bearish"):
+        risks.append("Daily bearish BOS")
 
-    if tech_profile.get(
-        "daily_bos_bearish"
-    ):
-        risks.append(
-            "Daily bearish BOS"
-        )
+    if tech_profile.get("daily_choch_bearish"):
+        risks.append("Daily bearish CHOCH")
 
-    if tech_profile.get(
-        "daily_choch_bearish"
-    ):
-        risks.append(
-            "Daily bearish CHOCH"
-        )
-
-    event_available = bool(
-        event_profile.get(
-            "available",
-            False,
-        )
-    )
+    event_available = bool(event_profile.get("available", False))
 
     if not event_available:
         missing_data.append(
@@ -221,30 +181,17 @@ def evaluate_candidate(
         )
         sentiment = "Unknown"
     else:
-        sentiment = event_profile.get(
-            "sentiment",
-            "Neutral",
-        )
+        sentiment = event_profile.get("sentiment", "Neutral")
 
     if sentiment == "Negative":
         risks.append(
             "Negative material event: "
-            + str(
-                event_profile.get(
-                    "title",
-                    "",
-                )
-            ).strip()
+            + str(event_profile.get("title", "")).strip()
         )
     elif sentiment == "Positive":
         positive.append(
             "Positive corporate-development event: "
-            + str(
-                event_profile.get(
-                    "title",
-                    "",
-                )
-            ).strip()
+            + str(event_profile.get("title", "")).strip()
         )
 
     hard_reject = (
@@ -257,18 +204,12 @@ def evaluate_candidate(
     )
 
     bearish_daily = bool(
-        tech_profile.get(
-            "daily_bos_bearish"
-        )
-        or tech_profile.get(
-            "daily_choch_bearish"
-        )
+        tech_profile.get("daily_bos_bearish")
+        or tech_profile.get("daily_choch_bearish")
     )
 
     bullish_context = (
-        tech_profile.get(
-            "daily_trend"
-        ) == "Bullish"
+        tech_profile.get("daily_trend") == "Bullish"
         and bullish_structure_event
         and not bearish_daily
     )
@@ -276,14 +217,12 @@ def evaluate_candidate(
     evidence_complete = (
         event_available
         and not is_financial
+        and candidate_data_eligible
     )
 
     if hard_reject:
         decision = "REJECT"
-    elif (
-        bullish_context
-        and evidence_complete
-    ):
+    elif bullish_context and evidence_complete:
         decision = "CANDIDATE"
     else:
         decision = "WATCH"
