@@ -4,7 +4,7 @@ import calendar
 import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -98,6 +98,79 @@ ANALYST_TERMS = (
     "earnings call",
 )
 
+# feedparser reliably normalizes standard RSS/Atom dates, but the live NSE
+# feeds can expose non-standard/custom entry fields. These are explicit,
+# publication/broadcast-oriented fallbacks only. Event dates such as record
+# date, ex-date, book-closure date, meeting date, etc. are intentionally NOT
+# used as publication timestamps.
+ENTRY_PARSED_DATE_KEYS = (
+    "published_parsed",
+    "updated_parsed",
+    "created_parsed",
+)
+
+ENTRY_RAW_DATE_KEYS = (
+    "published",
+    "updated",
+    "created",
+    "pubdate",
+    "pub_date",
+    "publication_date",
+    "publicationdate",
+    "publication_datetime",
+    "publicationdatetime",
+    "announcement_date",
+    "announcementdate",
+    "announcement_datetime",
+    "announcementdatetime",
+    "broadcast_date",
+    "broadcastdate",
+    "broadcast_datetime",
+    "broadcastdatetime",
+    "sort_date",
+    "sortdate",
+    "an_dt",
+    "date",
+    "datetime",
+    "timestamp",
+)
+
+FEED_PARSED_DATE_KEYS = (
+    "updated_parsed",
+    "published_parsed",
+    "created_parsed",
+    "modified_parsed",
+)
+
+FEED_RAW_DATE_KEYS = (
+    "updated",
+    "published",
+    "created",
+    "modified",
+    "pubdate",
+    "pub_date",
+    "lastbuilddate",
+    "last_build_date",
+)
+
+CUSTOM_DATETIME_FORMATS = (
+    "%d-%b-%Y %H:%M:%S",
+    "%d-%b-%Y %H:%M",
+    "%d-%b-%Y",
+    "%d-%m-%Y %H:%M:%S",
+    "%d-%m-%Y %H:%M",
+    "%d-%m-%Y",
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M",
+    "%d/%m/%Y",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M",
+    "%Y/%m/%d",
+)
+
 
 def _as_of_ist(
     as_of: Optional[datetime] = None,
@@ -162,43 +235,20 @@ def _source_specs() -> List[Dict]:
     return specs
 
 
-def _entry_datetime(
-    entry,
-) -> Optional[datetime]:
-    for key in (
-        "published_parsed",
-        "updated_parsed",
-        "created_parsed",
-    ):
-        parsed = entry.get(key)
-        if parsed:
-            try:
-                epoch = calendar.timegm(parsed)
-                return datetime.fromtimestamp(
-                    epoch,
-                    tz=timezone.utc,
-                ).astimezone(IST)
-            except Exception:
-                pass
+def _mapping_get(mapping, key: str):
+    if mapping is None:
+        return None
 
-    for key in (
-        "published",
-        "updated",
-        "created",
-    ):
-        raw = str(entry.get(key, "") or "").strip()
-        if not raw:
-            continue
+    try:
+        if hasattr(mapping, "get"):
+            return mapping.get(key)
+    except Exception:
+        pass
 
-        try:
-            parsed = parsedate_to_datetime(raw)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.astimezone(IST)
-        except Exception:
-            continue
-
-    return None
+    try:
+        return getattr(mapping, key)
+    except Exception:
+        return None
 
 
 def _clean_text(value) -> str:
@@ -207,6 +257,167 @@ def _clean_text(value) -> str:
         " ",
         str(value or "").strip(),
     )
+
+
+def _parse_datetime_value(
+    value,
+    *,
+    parsed_tuple_is_utc: bool = False,
+) -> Optional[datetime]:
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=IST)
+        return value.astimezone(IST)
+
+    # feedparser *_parsed fields are UTC time tuples / struct_time.
+    if isinstance(value, (tuple, list)) and len(value) >= 6:
+        try:
+            if parsed_tuple_is_utc:
+                epoch = calendar.timegm(value)
+                return datetime.fromtimestamp(
+                    epoch,
+                    tz=timezone.utc,
+                ).astimezone(IST)
+
+            parsed = datetime(
+                int(value[0]),
+                int(value[1]),
+                int(value[2]),
+                int(value[3]),
+                int(value[4]),
+                int(value[5]),
+                tzinfo=IST,
+            )
+            return parsed
+        except Exception:
+            return None
+
+    if isinstance(value, (int, float)):
+        try:
+            numeric = float(value)
+
+            # Tolerate epoch milliseconds.
+            if numeric > 10_000_000_000:
+                numeric /= 1000.0
+
+            return datetime.fromtimestamp(
+                numeric,
+                tz=timezone.utc,
+            ).astimezone(IST)
+        except Exception:
+            return None
+
+    raw = _clean_text(value)
+    if not raw:
+        return None
+
+    # Common timezone abbreviation cleanup. A naked IST string is ambiguous to
+    # many stdlib parsers, but NSE context is explicitly India Standard Time.
+    raw_ist = re.sub(
+        r"\bIST\b",
+        "+0530",
+        raw,
+        flags=re.IGNORECASE,
+    )
+
+    try:
+        parsed = parsedate_to_datetime(raw_ist)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=IST)
+        return parsed.astimezone(IST)
+    except Exception:
+        pass
+
+    iso_candidate = raw_ist.replace("Z", "+00:00")
+
+    try:
+        parsed = datetime.fromisoformat(iso_candidate)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=IST)
+        return parsed.astimezone(IST)
+    except Exception:
+        pass
+
+    for fmt in CUSTOM_DATETIME_FORMATS:
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            return parsed.replace(tzinfo=IST)
+        except Exception:
+            continue
+
+    return None
+
+
+def _entry_datetime_with_source(
+    entry,
+) -> Tuple[Optional[datetime], Optional[str]]:
+    for key in ENTRY_PARSED_DATE_KEYS:
+        parsed = _mapping_get(entry, key)
+        if parsed:
+            value = _parse_datetime_value(
+                parsed,
+                parsed_tuple_is_utc=True,
+            )
+            if value is not None:
+                return value, key
+
+    for key in ENTRY_RAW_DATE_KEYS:
+        raw = _mapping_get(entry, key)
+        if raw in (None, ""):
+            continue
+
+        value = _parse_datetime_value(raw)
+        if value is not None:
+            return value, key
+
+    return None, None
+
+
+def _entry_datetime(
+    entry,
+) -> Optional[datetime]:
+    value, _ = _entry_datetime_with_source(entry)
+    return value
+
+
+def _feed_datetime_with_source(
+    parsed_feed,
+) -> Tuple[Optional[datetime], Optional[str]]:
+    feed_meta = _mapping_get(parsed_feed, "feed")
+
+    for key in FEED_PARSED_DATE_KEYS:
+        for container_name, container in (
+            ("feed", feed_meta),
+            ("response", parsed_feed),
+        ):
+            raw = _mapping_get(container, key)
+            if not raw:
+                continue
+
+            value = _parse_datetime_value(
+                raw,
+                parsed_tuple_is_utc=True,
+            )
+            if value is not None:
+                return value, f"{container_name}.{key}"
+
+    for key in FEED_RAW_DATE_KEYS:
+        for container_name, container in (
+            ("feed", feed_meta),
+            ("response", parsed_feed),
+        ):
+            raw = _mapping_get(container, key)
+            if raw in (None, ""):
+                continue
+
+            value = _parse_datetime_value(raw)
+            if value is not None:
+                return value, f"{container_name}.{key}"
+
+    return None, None
 
 
 def _normalize_for_match(value: str) -> str:
@@ -308,11 +519,10 @@ def parse_corporate_action_factor(
     text: str,
 ) -> Optional[Dict]:
     """
-    Parse only straightforward bonus / face-value split ratios.
+    Parse straightforward bonus / face-value split ratios only.
 
-    The returned factor is theoretical. It is not automatically applied to
-    Groww history in this phase. It is surfaced so the later corporate-action
-    adjustment layer can cross-check the existing discontinuity guard.
+    The returned factor is theoretical evidence. It is NOT automatically
+    applied to historical Groww prices in this phase.
     """
     cleaned = _clean_text(text)
 
@@ -333,9 +543,6 @@ def classify_event_text(
 
     Returns:
       event_type, sentiment, materiality
-
-    Titles are intentionally NOT treated as natural-language investment advice.
-    Only high-confidence keyword classes get Positive/Negative sentiment.
     """
     text = f"{title} {summary}".strip().lower()
 
@@ -376,15 +583,17 @@ def _normalize_entry(
     entry,
     spec: Dict,
 ) -> Dict:
-    title = _clean_text(entry.get("title", ""))
+    title = _clean_text(_mapping_get(entry, "title"))
     summary = _clean_text(
-        entry.get(
-            "summary",
-            entry.get("description", ""),
-        )
+        _mapping_get(entry, "summary")
+        or _mapping_get(entry, "description")
     )
-    link = _clean_text(entry.get("link", ""))
-    published_at = _entry_datetime(entry)
+    link = _clean_text(_mapping_get(entry, "link"))
+
+    published_at, published_at_source = _entry_datetime_with_source(
+        entry
+    )
+
     symbol_hint = _extract_symbol_hint(
         title,
         summary,
@@ -405,6 +614,8 @@ def _normalize_entry(
             if published_at is not None
             else None
         ),
+        "published_at_source": published_at_source,
+        "timestamp_verified": published_at is not None,
         "source_id": spec["source_id"],
         "source_type": spec["source_type"],
         "source_url": spec["url"],
@@ -416,17 +627,30 @@ def _normalize_entry(
 def _dedupe_items(
     items: List[Dict],
 ) -> List[Dict]:
+    """
+    Deduplicate inside a source, not across official source families.
+
+    The same filing can legitimately appear in announcements and a dedicated
+    results/actions feed. Preserving the source_id in the key prevents source
+    provenance from disappearing.
+    """
     seen = set()
     deduped: List[Dict] = []
 
     for item in items:
+        source_id = str(item.get("source_id", "") or "")
         link = str(item.get("link", "") or "").strip()
+
         if link:
-            key = ("link", link)
+            key = (
+                source_id,
+                "link",
+                link,
+            )
         else:
             key = (
+                source_id,
                 "text",
-                item.get("source_type"),
                 _normalize_for_match(item.get("title", "")),
                 item.get("published_at"),
             )
@@ -448,7 +672,10 @@ def _source_age_days(
         return None
 
     seconds = (now - latest).total_seconds()
+
     if seconds < 0:
+        # Small clock skew / future server timestamp should not become a
+        # negative age. Keep it visible through latest_item_at.
         return 0.0
 
     return round(seconds / 86400.0, 3)
@@ -462,6 +689,7 @@ def _fetch_source(
     warnings: List[str] = []
 
     url = str(spec.get("url", "") or "").strip()
+
     if not url:
         return (
             {
@@ -469,8 +697,12 @@ def _fetch_source(
                 "available": False,
                 "candidate_eligible": False,
                 "entry_count": 0,
+                "timestamped_entry_count": 0,
+                "undated_entry_count": 0,
                 "latest_item_at": None,
                 "latest_item_age_days": None,
+                "source_time_basis": "unverified",
+                "source_time_field": None,
                 "errors": ["Source URL is empty."],
                 "warnings": [],
             },
@@ -494,31 +726,37 @@ def _fetch_source(
                 "available": False,
                 "candidate_eligible": False,
                 "entry_count": 0,
+                "timestamped_entry_count": 0,
+                "undated_entry_count": 0,
                 "latest_item_at": None,
                 "latest_item_age_days": None,
+                "source_time_basis": "unverified",
+                "source_time_field": None,
                 "errors": [f"Feed request failed: {exc}"],
                 "warnings": [],
             },
             [],
         )
 
-    raw_entries = list(getattr(feed, "entries", []) or [])
+    raw_entries = list(
+        _mapping_get(feed, "entries")
+        or []
+    )
 
-    if getattr(feed, "bozo", False):
+    if bool(_mapping_get(feed, "bozo")):
         message = str(
-            getattr(
-                feed,
-                "bozo_exception",
-                "unknown parse warning",
-            )
+            _mapping_get(feed, "bozo_exception")
+            or "unknown parse warning"
         )
+
         if raw_entries:
             warnings.append(
-                f"Feed parser warning but entries were recovered: {message}"
+                "Feed parser warning but entries were recovered: "
+                + message
             )
         else:
             errors.append(
-                f"Feed parse failed: {message}"
+                "Feed parse failed: " + message
             )
 
     items = [
@@ -526,19 +764,49 @@ def _fetch_source(
         for entry in raw_entries
     ]
 
-    parsed_dates = []
+    parsed_dates: List[datetime] = []
+
     for item in items:
         raw = item.get("published_at")
         if not raw:
             continue
+
         try:
             parsed_dates.append(
-                datetime.fromisoformat(raw).astimezone(IST)
+                datetime.fromisoformat(
+                    str(raw)
+                ).astimezone(IST)
             )
         except Exception:
             continue
 
-    latest = max(parsed_dates) if parsed_dates else None
+    latest_entry = (
+        max(parsed_dates)
+        if parsed_dates
+        else None
+    )
+
+    feed_datetime, feed_datetime_source = (
+        _feed_datetime_with_source(feed)
+    )
+
+    if latest_entry is not None:
+        latest = latest_entry
+        source_time_basis = "entry_timestamp"
+        source_time_field = "latest_entry"
+    elif feed_datetime is not None:
+        latest = feed_datetime
+        source_time_basis = "feed_metadata"
+        source_time_field = feed_datetime_source
+        warnings.append(
+            "No entry publication timestamps were parseable; "
+            "source freshness is based on feed-level metadata."
+        )
+    else:
+        latest = None
+        source_time_basis = "unverified"
+        source_time_field = None
+
     age_days = _source_age_days(
         latest,
         now,
@@ -555,10 +823,18 @@ def _fetch_source(
         and age_days <= NEWS_SOURCE_MAX_STALE_DAYS
     )
 
+    timestamped_entry_count = sum(
+        bool(item.get("timestamp_verified"))
+        for item in items
+    )
+    undated_entry_count = (
+        len(items) - timestamped_entry_count
+    )
+
     if available and latest is None:
         warnings.append(
-            "Feed entries were received but no parseable publication "
-            "timestamp was found."
+            "Feed entries were received, but neither entry-level nor "
+            "feed-level publication/update timestamps were parseable."
         )
 
     if (
@@ -567,13 +843,15 @@ def _fetch_source(
         and age_days > NEWS_SOURCE_MAX_STALE_DAYS
     ):
         warnings.append(
-            f"Latest feed item is {age_days:.1f} day(s) old; "
+            f"Latest source timestamp is {age_days:.1f} day(s) old; "
             f"candidate freshness maximum is "
             f"{NEWS_SOURCE_MAX_STALE_DAYS} day(s)."
         )
 
     if not raw_entries and not errors:
-        errors.append("Source returned zero RSS entries.")
+        errors.append(
+            "Source returned zero RSS entries."
+        )
         available = False
         source_candidate_eligible = False
 
@@ -582,12 +860,21 @@ def _fetch_source(
         "available": available,
         "candidate_eligible": source_candidate_eligible,
         "entry_count": len(items),
+        "timestamped_entry_count": timestamped_entry_count,
+        "undated_entry_count": undated_entry_count,
         "latest_item_at": (
             latest.isoformat()
             if latest is not None
             else None
         ),
         "latest_item_age_days": age_days,
+        "source_time_basis": source_time_basis,
+        "source_time_field": source_time_field,
+        "feed_timestamp_at": (
+            feed_datetime.isoformat()
+            if feed_datetime is not None
+            else None
+        ),
         "errors": errors,
         "warnings": warnings,
     }
@@ -601,17 +888,12 @@ def fetch_nse_announcements(
     """
     Fetch official NSE corporate-information RSS feeds.
 
-    Naming is retained for backward compatibility with main.py, but this
-    function now returns a multi-source event bundle:
-      - announcements (required)
-      - corporate actions (required)
-      - financial results (context)
-      - board meetings (context)
-      - optional supplemental RSS feeds
+    `available` means the primary announcements feed returned usable entries.
 
-    "available" means the official announcements source is reachable.
-    "candidate_eligible" is stricter: every required official source must be
-    available AND fresh enough.
+    `candidate_eligible` is stricter. Every required official source must be
+    available and have verifiable recent source freshness.
+
+    Missing timestamps are never silently converted into "fresh".
     """
     now = _as_of_ist(as_of)
 
@@ -643,12 +925,12 @@ def fetch_nse_announcements(
         if spec.get("required_for_candidate"):
             if not status.get("available"):
                 candidate_blockers.append(
-                    f"Required event source unavailable: "
+                    "Required event source unavailable: "
                     f"{status['source_id']}."
                 )
             elif not status.get("candidate_eligible"):
                 candidate_blockers.append(
-                    f"Required event source is not fresh/candidate-grade: "
+                    "Required event source is not fresh/candidate-grade: "
                     f"{status['source_id']}."
                 )
 
@@ -665,7 +947,10 @@ def fetch_nse_announcements(
     )
 
     available = bool(
-        announcement_status.get("available", False)
+        announcement_status.get(
+            "available",
+            False,
+        )
     )
 
     candidate_eligible = bool(
@@ -718,12 +1003,18 @@ def _company_name_matches(
     text: str,
 ) -> bool:
     normalized_text = _normalize_for_match(text)
+
     if not normalized_text:
         return False
 
     for alias in aliases:
-        normalized_alias = _normalize_for_match(alias)
+        normalized_alias = _normalize_for_match(
+            alias
+        )
 
+        # Avoid unsafe fuzzy matching and very short aliases such as "TCS"
+        # through company-name substring logic. Short exchange symbols are
+        # handled separately by exact token matching.
         if len(normalized_alias) < 6:
             continue
 
@@ -741,7 +1032,8 @@ def _item_matches_symbol(
     symbol = symbol.strip().upper()
 
     hint = str(
-        item.get("symbol_hint", "") or ""
+        item.get("symbol_hint", "")
+        or ""
     ).strip().upper()
 
     if hint and hint == symbol:
@@ -774,16 +1066,21 @@ def _published_datetime_from_item(
     item: Dict,
 ) -> Optional[datetime]:
     raw = item.get("published_at")
+
     if not raw:
         return None
 
     try:
-        parsed = datetime.fromisoformat(str(raw))
+        parsed = datetime.fromisoformat(
+            str(raw)
+        )
     except Exception:
         return None
 
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=IST)
+        parsed = parsed.replace(
+            tzinfo=IST
+        )
 
     return parsed.astimezone(IST)
 
@@ -792,16 +1089,20 @@ def _within_event_window(
     item: Dict,
     now: datetime,
 ) -> bool:
-    published = _published_datetime_from_item(item)
+    published = _published_datetime_from_item(
+        item
+    )
 
     if published is None:
-        # Keep the item visible, but source freshness has already been assessed
-        # independently at the bundle level.
-        return True
+        return False
 
     age_days = (
         now - published
     ).total_seconds() / 86400.0
+
+    if age_days < 0:
+        # A small future clock skew can still represent a current item.
+        return True
 
     return age_days <= NEWS_EVENT_LOOKBACK_DAYS
 
@@ -827,7 +1128,10 @@ def _event_rank(
         0,
     )
 
-    published = _published_datetime_from_item(event)
+    published = _published_datetime_from_item(
+        event
+    )
+
     timestamp = (
         published.timestamp()
         if published is not None
@@ -837,6 +1141,18 @@ def _event_rank(
     return (
         sentiment_score + materiality_score,
         timestamp,
+    )
+
+
+def _dedupe_blockers(
+    values: Iterable[str],
+) -> List[str]:
+    return list(
+        dict.fromkeys(
+            str(value)
+            for value in values
+            if str(value).strip()
+        )
     )
 
 
@@ -855,8 +1171,12 @@ def event_profile_for_symbol(
     )
 
     source_available = bool(
-        feed_result.get("available", False)
+        feed_result.get(
+            "available",
+            False,
+        )
     )
+
     source_candidate_eligible = bool(
         feed_result.get(
             "candidate_eligible",
@@ -876,9 +1196,15 @@ def event_profile_for_symbol(
         if text:
             alias_values.append(text)
 
-    # Preserve order while removing duplicate aliases.
     alias_values = list(
         dict.fromkeys(alias_values)
+    )
+
+    base_blockers = list(
+        feed_result.get(
+            "candidate_blockers",
+            [],
+        )
     )
 
     if not source_available:
@@ -892,14 +1218,13 @@ def event_profile_for_symbol(
             "source": "",
             "source_type": "",
             "event_count": 0,
+            "undated_event_count": 0,
             "matched_events": [],
+            "undated_matches": [],
             "corporate_actions": [],
             "freshest_event_at": None,
-            "candidate_blockers": list(
-                feed_result.get(
-                    "candidate_blockers",
-                    [],
-                )
+            "candidate_blockers": _dedupe_blockers(
+                base_blockers
             ),
             "source_coverage": list(
                 feed_result.get(
@@ -922,6 +1247,7 @@ def event_profile_for_symbol(
         }
 
     matched: List[Dict] = []
+    undated_matches: List[Dict] = []
 
     for item in feed_result.get("items", []) or []:
         is_match, match_method = _item_matches_symbol(
@@ -931,12 +1257,6 @@ def event_profile_for_symbol(
         )
 
         if not is_match:
-            continue
-
-        if not _within_event_window(
-            item,
-            now,
-        ):
             continue
 
         event_type, sentiment, materiality = classify_event_text(
@@ -955,6 +1275,18 @@ def event_profile_for_symbol(
             }
         )
 
+        if not item.get("timestamp_verified"):
+            undated_matches.append(
+                enriched
+            )
+            continue
+
+        if not _within_event_window(
+            item,
+            now,
+        ):
+            continue
+
         matched.append(enriched)
 
     matched.sort(
@@ -962,15 +1294,37 @@ def event_profile_for_symbol(
         reverse=True,
     )
 
-    limited = matched[:NEWS_MAX_MATCHED_EVENTS]
+    limited = matched[
+        :NEWS_MAX_MATCHED_EVENTS
+    ]
+
+    limited_undated = undated_matches[
+        :NEWS_MAX_MATCHED_EVENTS
+    ]
 
     corporate_actions = [
         {
-            "title": event.get("title", ""),
-            "summary": event.get("summary", ""),
-            "published_at": event.get("published_at"),
-            "source_id": event.get("source_id"),
-            "link": event.get("link", ""),
+            "title": event.get(
+                "title",
+                "",
+            ),
+            "summary": event.get(
+                "summary",
+                "",
+            ),
+            "published_at": event.get(
+                "published_at"
+            ),
+            "published_at_source": event.get(
+                "published_at_source"
+            ),
+            "source_id": event.get(
+                "source_id"
+            ),
+            "link": event.get(
+                "link",
+                "",
+            ),
             **event["corporate_action"],
         }
         for event in limited
@@ -981,30 +1335,51 @@ def event_profile_for_symbol(
         _published_datetime_from_item(item)
         for item in matched
     ]
+
     dated = [
         item
         for item in dated
         if item is not None
     ]
 
-    freshest = max(dated) if dated else None
+    freshest = (
+        max(dated)
+        if dated
+        else None
+    )
+
+    blockers = list(
+        base_blockers
+    )
+
+    if undated_matches:
+        blockers.append(
+            "Matched event(s) exist but their publication timestamp "
+            "could not be verified."
+        )
+
+    per_symbol_candidate_eligible = bool(
+        source_candidate_eligible
+        and not undated_matches
+    )
 
     common = {
         "available": True,
-        "candidate_eligible": source_candidate_eligible,
+        "candidate_eligible": per_symbol_candidate_eligible,
         "event_count": len(matched),
+        "undated_event_count": len(
+            undated_matches
+        ),
         "matched_events": limited,
+        "undated_matches": limited_undated,
         "corporate_actions": corporate_actions,
         "freshest_event_at": (
             freshest.isoformat()
             if freshest is not None
             else None
         ),
-        "candidate_blockers": list(
-            feed_result.get(
-                "candidate_blockers",
-                [],
-            )
+        "candidate_blockers": _dedupe_blockers(
+            blockers
         ),
         "source_coverage": list(
             feed_result.get(
@@ -1027,6 +1402,31 @@ def event_profile_for_symbol(
     }
 
     if not matched:
+        if undated_matches:
+            primary = undated_matches[0]
+
+            return {
+                **common,
+                "sentiment": "Unknown",
+                "event_type": "TimestampUnverified",
+                "materiality": primary.get(
+                    "materiality",
+                    "Unknown",
+                ),
+                "title": primary.get(
+                    "title",
+                    "",
+                ),
+                "source": primary.get(
+                    "source_id",
+                    "",
+                ),
+                "source_type": primary.get(
+                    "source_type",
+                    "",
+                ),
+            }
+
         return {
             **common,
             "sentiment": "Neutral",
@@ -1044,9 +1444,18 @@ def event_profile_for_symbol(
         "sentiment": primary["sentiment"],
         "event_type": primary["event_type"],
         "materiality": primary["materiality"],
-        "title": primary.get("title", ""),
-        "source": primary.get("source_id", ""),
-        "source_type": primary.get("source_type", ""),
+        "title": primary.get(
+            "title",
+            "",
+        ),
+        "source": primary.get(
+            "source_id",
+            "",
+        ),
+        "source_type": primary.get(
+            "source_type",
+            "",
+        ),
     }
 
 
@@ -1067,5 +1476,9 @@ if __name__ == "__main__":
             f"available={status['available']} "
             f"candidate_eligible={status['candidate_eligible']} "
             f"entries={status['entry_count']} "
-            f"latest={status['latest_item_at']}"
+            f"timestamped={status.get('timestamped_entry_count')} "
+            f"undated={status.get('undated_entry_count')} "
+            f"latest={status['latest_item_at']} "
+            f"basis={status.get('source_time_basis')} "
+            f"field={status.get('source_time_field')}"
         )

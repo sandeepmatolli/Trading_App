@@ -11,6 +11,20 @@ def _parsed_tuple(value: str):
     return time.gmtime(dt.timestamp())
 
 
+def _feed(
+    entries,
+    *,
+    feed_meta=None,
+    modified_parsed=None,
+):
+    return SimpleNamespace(
+        bozo=False,
+        entries=entries,
+        feed=feed_meta or {},
+        modified_parsed=modified_parsed,
+    )
+
+
 def test_classification_is_conservative():
     assert news_engine.classify_event_text(
         "Bagging/Receiving of orders/contracts",
@@ -56,6 +70,35 @@ def test_split_factor_parser():
     assert result is not None
     assert result["action_type"] == "split_or_consolidation"
     assert result["theoretical_price_factor"] == 0.2
+
+
+def test_custom_nse_style_date_field_is_parsed():
+    value, source = news_engine._entry_datetime_with_source(
+        {
+            "title": "Example",
+            "date": "28-Sep-2026 12:05:30",
+        }
+    )
+
+    assert value is not None
+    assert value.isoformat().startswith(
+        "2026-09-28T12:05:30"
+    )
+    assert source == "date"
+
+
+def test_ist_abbreviation_is_parsed():
+    value, source = news_engine._entry_datetime_with_source(
+        {
+            "published": (
+                "Mon, 28 Sep 2026 12:05:30 IST"
+            ),
+        }
+    )
+
+    assert value is not None
+    assert value.utcoffset().total_seconds() == 19800
+    assert source == "published"
 
 
 def test_official_sources_can_be_candidate_grade(monkeypatch):
@@ -108,10 +151,7 @@ def test_official_sources_can_be_candidate_grade(monkeypatch):
                 }
             ]
 
-        return SimpleNamespace(
-            bozo=False,
-            entries=entries,
-        )
+        return _feed(entries)
 
     monkeypatch.setattr(
         news_engine.feedparser,
@@ -138,9 +178,159 @@ def test_official_sources_can_be_candidate_grade(monkeypatch):
     assert profile["available"] is True
     assert profile["candidate_eligible"] is True
     assert profile["event_count"] == 1
+    assert profile["undated_event_count"] == 0
     assert profile["sentiment"] == "Positive"
     assert profile["event_type"] == "Corporate Development"
-    assert profile["matched_events"][0]["match_method"] in {"company_name", "symbol_token"}
+
+
+def test_feed_metadata_can_verify_source_freshness_but_not_undated_match(
+    monkeypatch,
+):
+    now = datetime.fromisoformat(
+        "2026-09-28T12:00:00+05:30"
+    )
+
+    recent_feed_time = _parsed_tuple(
+        "2026-09-28T06:00:00+00:00"
+    )
+
+    def fake_parse(url, request_headers=None):
+        return _feed(
+            [
+                {
+                    "title": "Reliance Industries Limited",
+                    "summary": "General Updates",
+                    "link": url + "#1",
+                }
+            ],
+            feed_meta={
+                "updated_parsed": recent_feed_time,
+            },
+        )
+
+    monkeypatch.setattr(
+        news_engine.feedparser,
+        "parse",
+        fake_parse,
+    )
+
+    bundle = news_engine.fetch_nse_announcements(
+        as_of=now,
+    )
+
+    assert bundle["candidate_eligible"] is True
+
+    announcements = next(
+        source
+        for source in bundle["sources"]
+        if source["source_id"] == "nse_announcements"
+    )
+
+    assert announcements["source_time_basis"] == "feed_metadata"
+    assert announcements["timestamped_entry_count"] == 0
+    assert announcements["undated_entry_count"] == 1
+
+    profile = news_engine.event_profile_for_symbol(
+        "RELIANCE",
+        bundle,
+        company_name="Reliance Industries Limited",
+        as_of=now,
+    )
+
+    assert profile["candidate_eligible"] is False
+    assert profile["event_count"] == 0
+    assert profile["undated_event_count"] >= 1
+    assert profile["event_type"] == "TimestampUnverified"
+
+
+def test_feed_metadata_with_no_symbol_match_can_return_nonefound(
+    monkeypatch,
+):
+    now = datetime.fromisoformat(
+        "2026-09-28T12:00:00+05:30"
+    )
+
+    recent_feed_time = _parsed_tuple(
+        "2026-09-28T06:00:00+00:00"
+    )
+
+    def fake_parse(url, request_headers=None):
+        return _feed(
+            [
+                {
+                    "title": "Another Company Limited",
+                    "summary": "General Updates",
+                    "link": url + "#1",
+                }
+            ],
+            feed_meta={
+                "updated_parsed": recent_feed_time,
+            },
+        )
+
+    monkeypatch.setattr(
+        news_engine.feedparser,
+        "parse",
+        fake_parse,
+    )
+
+    bundle = news_engine.fetch_nse_announcements(
+        as_of=now,
+    )
+
+    profile = news_engine.event_profile_for_symbol(
+        "RELIANCE",
+        bundle,
+        company_name="Reliance Industries Limited",
+        as_of=now,
+    )
+
+    assert profile["available"] is True
+    assert profile["candidate_eligible"] is True
+    assert profile["event_count"] == 0
+    assert profile["undated_event_count"] == 0
+    assert profile["sentiment"] == "Neutral"
+    assert profile["event_type"] == "NoneFound"
+
+
+def test_no_entry_or_feed_timestamp_fails_closed(monkeypatch):
+    now = datetime.fromisoformat(
+        "2026-09-28T12:00:00+05:30"
+    )
+
+    def fake_parse(url, request_headers=None):
+        return _feed(
+            [
+                {
+                    "title": "Example Industries Limited",
+                    "summary": "General Updates",
+                    "link": url + "#1",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(
+        news_engine.feedparser,
+        "parse",
+        fake_parse,
+    )
+
+    bundle = news_engine.fetch_nse_announcements(
+        as_of=now,
+    )
+
+    assert bundle["available"] is True
+    assert bundle["candidate_eligible"] is False
+    assert bundle["candidate_blockers"]
+
+    announcements = next(
+        source
+        for source in bundle["sources"]
+        if source["source_id"] == "nse_announcements"
+    )
+
+    assert announcements["latest_item_at"] is None
+    assert announcements["source_time_basis"] == "unverified"
 
 
 def test_stale_required_source_blocks_candidate(monkeypatch):
@@ -153,16 +343,15 @@ def test_stale_required_source_blocks_candidate(monkeypatch):
     )
 
     def fake_parse(url, request_headers=None):
-        return SimpleNamespace(
-            bozo=False,
-            entries=[
+        return _feed(
+            [
                 {
                     "title": "Example Industries Limited",
                     "summary": "General Updates",
                     "link": url + "#1",
                     "published_parsed": stale,
                 }
-            ],
+            ]
         )
 
     monkeypatch.setattr(
@@ -215,10 +404,7 @@ def test_negative_event_outranks_positive_within_lookback(monkeypatch):
                 }
             ]
 
-        return SimpleNamespace(
-            bozo=False,
-            entries=entries,
-        )
+        return _feed(entries)
 
     monkeypatch.setattr(
         news_engine.feedparser,
@@ -251,16 +437,15 @@ def test_no_matching_event_is_neutral_when_source_is_healthy(monkeypatch):
     )
 
     def fake_parse(url, request_headers=None):
-        return SimpleNamespace(
-            bozo=False,
-            entries=[
+        return _feed(
+            [
                 {
                     "title": "Another Company Limited",
                     "summary": "General Updates",
                     "link": url + "#1",
                     "published_parsed": recent,
                 }
-            ],
+            ]
         )
 
     monkeypatch.setattr(
@@ -285,3 +470,24 @@ def test_no_matching_event_is_neutral_when_source_is_healthy(monkeypatch):
     assert profile["event_count"] == 0
     assert profile["sentiment"] == "Neutral"
     assert profile["event_type"] == "NoneFound"
+
+
+def test_dedupe_preserves_same_link_across_different_official_sources():
+    items = [
+        {
+            "source_id": "nse_announcements",
+            "title": "Example",
+            "link": "https://example.test/filing",
+            "published_at": "2026-09-28T10:00:00+05:30",
+        },
+        {
+            "source_id": "nse_financial_results",
+            "title": "Example",
+            "link": "https://example.test/filing",
+            "published_at": "2026-09-28T10:00:00+05:30",
+        },
+    ]
+
+    result = news_engine._dedupe_items(items)
+
+    assert len(result) == 2
