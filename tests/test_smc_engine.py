@@ -1,10 +1,14 @@
 import pandas as pd
 
 from technical.smc_engine import (
+    _filter_closed_period_end_bars,
     build_technical_profile,
     detect_liquidity_sweep,
     detect_price_discontinuities,
     filter_active_pois,
+    filter_closed_daily_for_smc,
+    filter_closed_one_hour_for_smc,
+    filter_closed_setup_75m_for_smc,
     find_fair_value_gaps,
     find_order_blocks,
 )
@@ -363,3 +367,238 @@ def test_active_poi_filter_excludes_resolved_fvg():
         and poi["created_at_index"] == 2
         for poi in active
     )
+
+def test_current_daily_is_excluded_before_session_close_and_allowed_after_close():
+    daily = pd.DataFrame(
+        {
+            "ts": pd.to_datetime(
+                [
+                    "2026-09-25 00:00:00+05:30",
+                    "2026-09-28 00:00:00+05:30",
+                ]
+            ),
+            "open": [100, 105],
+            "high": [110, 111],
+            "low": [95, 101],
+            "close": [108, 109],
+        }
+    )
+
+    intraday = filter_closed_daily_for_smc(
+        daily,
+        as_of=pd.Timestamp("2026-09-28 12:00:00+05:30"),
+    )
+    after_close = filter_closed_daily_for_smc(
+        daily,
+        as_of=pd.Timestamp("2026-09-28 15:31:00+05:30"),
+    )
+
+    assert len(intraday) == 1
+    assert intraday.iloc[-1]["ts"].date().isoformat() == "2026-09-25"
+    assert len(after_close) == 2
+
+
+def test_75m_smc_uses_only_closed_and_usable_windows():
+    setup = pd.DataFrame(
+        {
+            "ts": pd.to_datetime(
+                [
+                    "2026-09-25 14:15:00+05:30",
+                    "2026-09-28 09:15:00+05:30",
+                    "2026-09-28 10:30:00+05:30",
+                    "2026-09-28 11:45:00+05:30",
+                ]
+            ),
+            "open": [100, 101, 102, 103],
+            "high": [102, 103, 104, 105],
+            "low": [99, 100, 101, 102],
+            "close": [101, 102, 103, 104],
+            "is_usable": [False, True, True, True],
+            "expected_interval_minutes": [75, 75, 75, 75],
+        }
+    )
+
+    closed = filter_closed_setup_75m_for_smc(
+        setup,
+        as_of=pd.Timestamp("2026-09-28 12:00:00+05:30"),
+    )
+
+    # Historical unusable row is excluded; today's 11:45-13:00 window is not
+    # closed yet at 12:00. Only 09:15 and 10:30 are allowed into SMC.
+    assert len(closed) == 2
+    assert [ts.strftime("%H:%M") for ts in closed["ts"]] == [
+        "09:15",
+        "10:30",
+    ]
+
+
+def test_current_date_one_hour_is_withheld_while_session_is_open():
+    one_hour = pd.DataFrame(
+        {
+            "ts": pd.to_datetime(
+                [
+                    "2026-09-25 15:00:00+05:30",
+                    "2026-09-28 10:00:00+05:30",
+                    "2026-09-28 11:00:00+05:30",
+                ]
+            ),
+            "open": [100, 101, 102],
+            "high": [102, 103, 104],
+            "low": [99, 100, 101],
+            "close": [101, 102, 103],
+            "expected_interval_minutes": [60, 60, 60],
+        }
+    )
+
+    intraday = filter_closed_one_hour_for_smc(
+        one_hour,
+        as_of=pd.Timestamp("2026-09-28 12:00:00+05:30"),
+    )
+    after_close = filter_closed_one_hour_for_smc(
+        one_hour,
+        as_of=pd.Timestamp("2026-09-28 15:31:00+05:30"),
+    )
+
+    assert len(intraday) == 1
+    assert len(after_close) == 3
+
+
+def test_unfinished_week_and_month_are_not_used_for_smc():
+    weekly = pd.DataFrame(
+        {
+            "ts": pd.to_datetime(
+                [
+                    "2026-09-25 00:00:00+05:30",
+                    "2026-10-02 00:00:00+05:30",
+                ]
+            ),
+            "open": [100, 105],
+            "high": [110, 111],
+            "low": [95, 101],
+            "close": [108, 109],
+        }
+    )
+    monthly = pd.DataFrame(
+        {
+            "ts": pd.to_datetime(
+                [
+                    "2026-08-31 00:00:00+05:30",
+                    "2026-09-30 00:00:00+05:30",
+                ]
+            ),
+            "open": [100, 105],
+            "high": [110, 111],
+            "low": [95, 101],
+            "close": [108, 109],
+        }
+    )
+
+    as_of = pd.Timestamp("2026-09-28 12:00:00+05:30")
+
+    closed_weekly = _filter_closed_period_end_bars(weekly, as_of=as_of)
+    closed_monthly = _filter_closed_period_end_bars(monthly, as_of=as_of)
+
+    assert len(closed_weekly) == 1
+    assert len(closed_monthly) == 1
+    assert closed_weekly.iloc[-1]["ts"].date().isoformat() == "2026-09-25"
+    assert closed_monthly.iloc[-1]["ts"].date().isoformat() == "2026-08-31"
+
+
+def test_build_profile_reports_closed_bar_guard_and_drops_live_partial_bars():
+    daily_dates = pd.bdate_range(
+        end="2026-09-28",
+        periods=80,
+        tz="Asia/Kolkata",
+    )
+    daily = pd.DataFrame(
+        {
+            "ts": daily_dates,
+            "open": [100 + i * 0.1 for i in range(80)],
+            "high": [102 + i * 0.1 for i in range(80)],
+            "low": [99 + i * 0.1 for i in range(80)],
+            "close": [101 + i * 0.1 for i in range(80)],
+            "volume": [1000] * 80,
+        }
+    )
+
+    setup_rows = []
+    setup_start = pd.Timestamp("2026-09-25 09:15:00+05:30")
+    for i in range(5):
+        start = setup_start + pd.Timedelta(minutes=75 * i)
+        setup_rows.append(
+            {
+                "ts": start,
+                "open": 100 + i,
+                "high": 102 + i,
+                "low": 99 + i,
+                "close": 101 + i,
+                "is_usable": True,
+                "expected_interval_minutes": 75,
+            }
+        )
+
+    for start, usable in (
+        ("2026-09-28 09:15:00+05:30", True),
+        ("2026-09-28 10:30:00+05:30", True),
+        ("2026-09-28 11:45:00+05:30", False),
+    ):
+        setup_rows.append(
+            {
+                "ts": pd.Timestamp(start),
+                "open": 110,
+                "high": 112,
+                "low": 109,
+                "close": 111,
+                "is_usable": usable,
+                "expected_interval_minutes": 75,
+            }
+        )
+
+    setup = pd.DataFrame(setup_rows)
+
+    one_hour = pd.DataFrame(
+        {
+            "ts": pd.to_datetime(
+                [
+                    "2026-09-25 14:00:00+05:30",
+                    "2026-09-28 10:00:00+05:30",
+                ]
+            ),
+            "open": [100, 101],
+            "high": [102, 103],
+            "low": [99, 100],
+            "close": [101, 102],
+            "expected_interval_minutes": [60, 60],
+        }
+    )
+
+    profile = build_technical_profile(
+        daily=daily,
+        setup_75m=setup,
+        one_hour=one_hour,
+        data_quality={
+            "valid": True,
+            "candidate_eligible": True,
+            "reasons": [],
+            "warnings": [],
+            "candidate_blockers": [],
+        },
+        as_of=pd.Timestamp("2026-09-28 12:00:00+05:30"),
+    )
+
+    guard = profile["closed_bar_guard"]
+
+    assert guard["daily_input_rows"] == 80
+    assert guard["daily_closed_rows"] == 79
+    assert guard["daily_dropped_unclosed_or_future"] == 1
+    assert guard["setup_75m_input_rows"] == 8
+    assert guard["setup_75m_dropped_unusable"] == 1
+    assert guard["setup_75m_closed_usable_rows"] == 7
+    assert guard["one_hour_input_rows"] == 2
+    assert guard["one_hour_closed_rows"] == 1
+
+    # The SMC profile itself must match the filtered frames, not the raw input.
+    assert profile["daily_analysis_rows"] == 79
+    assert profile["setup_75m_analysis_rows"] == 7
+    assert profile["one_hour_analysis_rows"] == 1
+

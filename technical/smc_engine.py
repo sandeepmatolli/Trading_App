@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime, time as dt_time
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from config import NSE_SESSION_END
 
 
 REQUIRED_OHLC = {"open", "high", "low", "close"}
@@ -48,6 +52,19 @@ ACTIVE_POI_MAX_AGE_BARS = {
     "setup_75m": 100,
     "one_hour": 120,
 }
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def _parse_clock(value: str) -> dt_time:
+    try:
+        hour, minute = value.split(":", 1)
+        return dt_time(hour=int(hour), minute=int(minute))
+    except Exception as exc:
+        raise ValueError(f"Invalid HH:MM time value: {value!r}") from exc
+
+
+SESSION_END = _parse_clock(NSE_SESSION_END)
 
 
 def _validate_ohlc(
@@ -328,6 +345,197 @@ def _resample_daily_for_smc(
     )
 
     return result
+
+
+def _as_ist_timestamp(
+    value,
+) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        return timestamp.tz_localize(IST)
+    return timestamp.tz_convert(IST)
+
+
+def _as_of_ist(
+    as_of: Optional[pd.Timestamp] = None,
+) -> pd.Timestamp:
+    if as_of is None:
+        return pd.Timestamp.now(tz=IST)
+    return _as_ist_timestamp(as_of)
+
+
+def _session_end_timestamp(
+    session_date,
+) -> pd.Timestamp:
+    return pd.Timestamp(
+        datetime.combine(
+            session_date,
+            SESSION_END,
+            tzinfo=IST,
+        )
+    )
+
+
+def filter_closed_daily_for_smc(
+    daily: pd.DataFrame,
+    as_of: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
+    """
+    Keep only completed Daily sessions for SMC.
+
+    Historical sessions are closed. A row stamped with today's session date is
+    withheld until the configured NSE session end has passed. Future-dated rows
+    are never used. This prevents an intraday partial Daily candle from
+    repainting Daily/Weekly/Monthly structure.
+    """
+    if daily is None or daily.empty:
+        return pd.DataFrame() if daily is None else daily.copy()
+    if "ts" not in daily.columns:
+        raise ValueError("Daily SMC frame requires a ts column.")
+
+    now = _as_of_ist(as_of)
+    today = now.date()
+    today_close = _session_end_timestamp(today)
+
+    keep: List[bool] = []
+    for value in daily["ts"]:
+        timestamp = _as_ist_timestamp(value)
+
+        if timestamp.date() < today:
+            keep.append(True)
+        elif timestamp.date() > today:
+            keep.append(False)
+        else:
+            keep.append(now >= today_close)
+
+    return (
+        daily.loc[keep]
+        .sort_values("ts")
+        .reset_index(drop=True)
+        .copy()
+    )
+
+
+def filter_closed_setup_75m_for_smc(
+    setup_75m: pd.DataFrame,
+    as_of: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
+    """
+    Keep only closed and usable 75-minute setup bars.
+
+    A bar is closed only after ts + 75 minutes. When the market-data layer
+    exposes `is_usable`, false rows are removed before SMC. Missing 15-minute
+    candles are never fabricated.
+    """
+    if setup_75m is None or setup_75m.empty:
+        return pd.DataFrame() if setup_75m is None else setup_75m.copy()
+    if "ts" not in setup_75m.columns:
+        raise ValueError("75m SMC frame requires a ts column.")
+
+    now = _as_of_ist(as_of)
+    work = setup_75m.copy()
+
+    if "is_usable" in work.columns:
+        work = work[work["is_usable"].fillna(False)].copy()
+
+    if work.empty:
+        return work.reset_index(drop=True)
+
+    keep: List[bool] = []
+    for value in work["ts"]:
+        start = _as_ist_timestamp(value)
+        end = start + pd.Timedelta(minutes=75)
+        keep.append(end <= now)
+
+    return (
+        work.loc[keep]
+        .sort_values("ts")
+        .reset_index(drop=True)
+        .copy()
+    )
+
+
+def filter_closed_one_hour_for_smc(
+    one_hour: Optional[pd.DataFrame],
+    as_of: Optional[pd.Timestamp] = None,
+) -> Optional[pd.DataFrame]:
+    """
+    Conservative closed-bar policy for Groww 1H data.
+
+    This project has observed inconsistent-looking 1H label edges and does not
+    assume whether every timestamp is a bucket open or bucket close. While the
+    current NSE session is still open, all current-date 1H rows are therefore
+    excluded from SMC. After session close, current-date rows are allowed.
+
+    The 75m setup frame remains the authoritative intraday structure feed.
+    """
+    if one_hour is None:
+        return None
+    if one_hour.empty:
+        return one_hour.copy()
+    if "ts" not in one_hour.columns:
+        raise ValueError("1H SMC frame requires a ts column.")
+
+    now = _as_of_ist(as_of)
+    today = now.date()
+    session_closed = now >= _session_end_timestamp(today)
+
+    keep: List[bool] = []
+    for value in one_hour["ts"]:
+        timestamp = _as_ist_timestamp(value)
+
+        if timestamp.date() < today:
+            keep.append(True)
+        elif timestamp.date() > today:
+            keep.append(False)
+        else:
+            keep.append(session_closed)
+
+    return (
+        one_hour.loc[keep]
+        .sort_values("ts")
+        .reset_index(drop=True)
+        .copy()
+    )
+
+
+def _filter_closed_period_end_bars(
+    frame: pd.DataFrame,
+    as_of: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
+    """
+    Keep only completed period-end labeled bars such as W-FRI and month-end.
+
+    Pandas resampling labels the current unfinished week/month at that period's
+    future end date. Those bars are excluded. If the period label is today, it
+    becomes usable only after the NSE session has closed.
+    """
+    if frame is None or frame.empty:
+        return pd.DataFrame() if frame is None else frame.copy()
+    if "ts" not in frame.columns:
+        raise ValueError("Higher-timeframe SMC frame requires a ts column.")
+
+    now = _as_of_ist(as_of)
+    today = now.date()
+    today_close = _session_end_timestamp(today)
+
+    keep: List[bool] = []
+    for value in frame["ts"]:
+        timestamp = _as_ist_timestamp(value)
+
+        if timestamp.date() < today:
+            keep.append(True)
+        elif timestamp.date() > today:
+            keep.append(False)
+        else:
+            keep.append(now >= today_close)
+
+    return (
+        frame.loc[keep]
+        .sort_values("ts")
+        .reset_index(drop=True)
+        .copy()
+    )
 
 
 def calculate_atr(
@@ -1168,16 +1376,26 @@ def build_technical_profile(
     monthly: Optional[pd.DataFrame] = None,
     one_hour: Optional[pd.DataFrame] = None,
     data_quality: Optional[Dict] = None,
+    as_of: Optional[pd.Timestamp] = None,
 ) -> Dict:
     """
-    Build deterministic SMC evidence.
+    Build deterministic SMC evidence from CLOSED bars only.
 
     V1 timeframe roles:
       Monthly -> macro context
       Weekly  -> primary swing structure
       Daily   -> setup structure
       75m     -> session-aligned refinement
-      1H      -> entry/near-term context
+      1H      -> secondary near-term context
+
+    Closed-bar safety:
+      - current Daily is withheld until the NSE session closes;
+      - 75m SMC receives only bars whose 75-minute window has completed AND
+        whose market-data `is_usable` flag is true;
+      - current-date 1H rows are withheld while the session is open because
+        Groww's timestamp edge semantics are not assumed;
+      - Weekly/Monthly are rebuilt from closed Daily and their unfinished
+        current periods are excluded.
 
     Corporate-action safety:
       - detect suspicious Daily price discontinuities;
@@ -1186,12 +1404,42 @@ def build_technical_profile(
         only from the latest post-boundary price regime;
       - Weekly/Monthly are rebuilt from that safe Daily segment so a split/
         bonus-style repricing cannot manufacture giant long-horizon FVGs.
+
+    `weekly` and `monthly` remain in the signature for backward compatibility,
+    but authoritative higher-timeframe SMC is rebuilt from closed Daily here.
     """
     profile: Dict = {}
+    now = _as_of_ist(as_of)
 
-    discontinuities = detect_price_discontinuities(daily)
-    safe_daily = _latest_safe_daily_segment(
+    closed_daily = filter_closed_daily_for_smc(
         daily,
+        as_of=now,
+    )
+    closed_setup_75m = filter_closed_setup_75m_for_smc(
+        setup_75m,
+        as_of=now,
+    )
+    closed_one_hour = filter_closed_one_hour_for_smc(
+        one_hour,
+        as_of=now,
+    )
+
+    raw_setup_rows = int(len(setup_75m)) if setup_75m is not None else 0
+    usable_setup_rows = raw_setup_rows
+    if (
+        setup_75m is not None
+        and not setup_75m.empty
+        and "is_usable" in setup_75m.columns
+    ):
+        usable_setup_rows = int(
+            setup_75m["is_usable"]
+            .fillna(False)
+            .sum()
+        )
+
+    discontinuities = detect_price_discontinuities(closed_daily)
+    safe_daily = _latest_safe_daily_segment(
+        closed_daily,
         discontinuities,
     )
 
@@ -1206,41 +1454,74 @@ def build_technical_profile(
             if not pd.isna(parsed_boundary):
                 latest_boundary_ts = parsed_boundary
 
-    if discontinuities:
-        safe_weekly = _resample_daily_for_smc(
-            safe_daily,
-            "W-FRI",
-        )
-        safe_monthly = _resample_daily_for_smc(
-            safe_daily,
-            "ME",
-        )
-    else:
-        safe_weekly = (
-            weekly.copy()
-            if weekly is not None
-            else _resample_daily_for_smc(
-                safe_daily,
-                "W-FRI",
-            )
-        )
-        safe_monthly = (
-            monthly.copy()
-            if monthly is not None
-            else _resample_daily_for_smc(
-                safe_daily,
-                "ME",
-            )
-        )
+    weekly_from_closed_daily = _resample_daily_for_smc(
+        safe_daily,
+        "W-FRI",
+    )
+    monthly_from_closed_daily = _resample_daily_for_smc(
+        safe_daily,
+        "ME",
+    )
+
+    safe_weekly = _filter_closed_period_end_bars(
+        weekly_from_closed_daily,
+        as_of=now,
+    )
+    safe_monthly = _filter_closed_period_end_bars(
+        monthly_from_closed_daily,
+        as_of=now,
+    )
 
     safe_setup_75m = _filter_frame_from_date(
-        setup_75m,
+        closed_setup_75m,
         latest_boundary_ts,
     )
     safe_one_hour = _filter_frame_from_date(
-        one_hour,
+        closed_one_hour,
         latest_boundary_ts,
     )
+
+    profile["closed_bar_guard"] = {
+        "enabled": True,
+        "as_of": str(now),
+        "policy": "closed_and_usable_bars_only",
+        "daily_input_rows": int(len(daily)) if daily is not None else 0,
+        "daily_closed_rows": int(len(closed_daily)),
+        "daily_dropped_unclosed_or_future": (
+            int(len(daily)) - int(len(closed_daily))
+            if daily is not None
+            else 0
+        ),
+        "setup_75m_input_rows": raw_setup_rows,
+        "setup_75m_usable_rows_before_close_filter": usable_setup_rows,
+        "setup_75m_closed_usable_rows": int(len(closed_setup_75m)),
+        "setup_75m_dropped_unusable": raw_setup_rows - usable_setup_rows,
+        "setup_75m_dropped_unclosed_or_future": (
+            usable_setup_rows - int(len(closed_setup_75m))
+        ),
+        "one_hour_input_rows": (
+            int(len(one_hour))
+            if one_hour is not None
+            else 0
+        ),
+        "one_hour_closed_rows": (
+            int(len(closed_one_hour))
+            if closed_one_hour is not None
+            else 0
+        ),
+        "one_hour_policy": (
+            "exclude current-date 1H while NSE session is open because "
+            "timestamp edge semantics are not assumed"
+        ),
+        "weekly_resampled_rows_before_close_filter": int(
+            len(weekly_from_closed_daily)
+        ),
+        "weekly_closed_rows": int(len(safe_weekly)),
+        "monthly_resampled_rows_before_close_filter": int(
+            len(monthly_from_closed_daily)
+        ),
+        "monthly_closed_rows": int(len(safe_monthly)),
+    }
 
     profile["corporate_action_guard"] = {
         "detected": bool(discontinuities),

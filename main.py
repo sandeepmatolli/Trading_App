@@ -219,6 +219,23 @@ def main() -> None:
             else:
                 tech_profile = {"data_quality": quality}
 
+            if quality.get("valid", False):
+                closed_guard = tech_profile.get(
+                    "closed_bar_guard",
+                    {},
+                )
+                print(
+                    f"{symbol}: SMC closed bars "
+                    f"daily={closed_guard.get('daily_closed_rows')}/"
+                    f"{closed_guard.get('daily_input_rows')} | "
+                    f"75m={closed_guard.get('setup_75m_closed_usable_rows')}/"
+                    f"{closed_guard.get('setup_75m_input_rows')} | "
+                    f"1H={closed_guard.get('one_hour_closed_rows')}/"
+                    f"{closed_guard.get('one_hour_input_rows')} | "
+                    f"weekly={closed_guard.get('weekly_closed_rows')} | "
+                    f"monthly={closed_guard.get('monthly_closed_rows')}"
+                )
+
             fund_row = indexed.loc[symbol]
 
             if isinstance(fund_row, pd.DataFrame):
