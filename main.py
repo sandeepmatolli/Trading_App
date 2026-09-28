@@ -159,6 +159,28 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _build_smc_profile(
+    market: Dict,
+    quality: Dict,
+) -> Dict:
+    if not quality.get(
+        "valid",
+        False,
+    ):
+        return {
+            "data_quality": quality
+        }
+
+    return build_technical_profile(
+        daily=market["daily"],
+        setup_75m=market["setup_75m"],
+        weekly=market["weekly"],
+        monthly=market["monthly"],
+        one_hour=market["hourly"],
+        data_quality=quality,
+    )
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -176,9 +198,13 @@ def main() -> None:
         return
 
     if args.max_symbols <= 0:
-        raise ValueError("--max-symbols must be greater than zero.")
+        raise ValueError(
+            "--max-symbols must be greater than zero."
+        )
 
-    requested = _parse_symbol_argument(args.symbols)
+    requested = _parse_symbol_argument(
+        args.symbols
+    )
 
     if requested:
         available = set(all_symbols)
@@ -200,13 +226,22 @@ def main() -> None:
             if symbol in available
         ]
     else:
-        symbols = all_symbols[: args.max_symbols]
+        symbols = all_symbols[
+            : args.max_symbols
+        ]
 
     if not symbols:
-        raise ValueError("No NSE symbols selected for analysis.")
+        raise ValueError(
+            "No NSE symbols selected for analysis."
+        )
 
+    from market_data.corporate_action_adjustment import (
+        build_adjusted_market_views,
+    )
     from market_data.groww_auth import get_groww_api
-    from market_data.groww_fetch import fetch_market_timeframes
+    from market_data.groww_fetch import (
+        fetch_market_timeframes,
+    )
     from news.corporate_action_reconciliation import (
         reconcile_corporate_action_guard,
     )
@@ -219,7 +254,9 @@ def main() -> None:
     )
 
     groww = get_groww_api()
-    news_bundle = fetch_nse_announcements()
+    news_bundle = (
+        fetch_nse_announcements()
+    )
 
     print(
         "NSE event evidence: "
@@ -229,7 +266,10 @@ def main() -> None:
         f"blockers={len(news_bundle.get('candidate_blockers', []))}"
     )
 
-    for source in news_bundle.get("sources", []):
+    for source in news_bundle.get(
+        "sources",
+        [],
+    ):
         print(
             f"  {source.get('source_id')}: "
             f"available={source.get('available')} | "
@@ -247,7 +287,9 @@ def main() -> None:
                 .str.upper()
             )
         )
-        .dropna(subset=["__nse"])
+        .dropna(
+            subset=["__nse"]
+        )
         .drop_duplicates(
             subset=["__nse"],
             keep="first",
@@ -258,7 +300,9 @@ def main() -> None:
     results: List[Dict] = []
 
     for symbol in symbols:
-        print(f"\nProcessing {symbol} ...")
+        print(
+            f"\nProcessing {symbol} ..."
+        )
 
         try:
             market = fetch_market_timeframes(
@@ -268,7 +312,9 @@ def main() -> None:
                 setup_15m_days=DEFAULT_SETUP_15M_DAYS,
             )
 
-            quality = market["quality"]
+            quality = market[
+                "quality"
+            ]
 
             print(
                 f"{symbol}: market-data quality "
@@ -281,24 +327,22 @@ def main() -> None:
                 f"max_gap={quality['max_daily_gap_days']}"
             )
 
-            if quality.get("valid", False):
-                tech_profile = build_technical_profile(
-                    daily=market["daily"],
-                    setup_75m=market["setup_75m"],
-                    weekly=market["weekly"],
-                    monthly=market["monthly"],
-                    one_hour=market["hourly"],
-                    data_quality=quality,
+            raw_tech_profile = (
+                _build_smc_profile(
+                    market,
+                    quality,
                 )
-            else:
-                tech_profile = {
-                    "data_quality": quality
-                }
+            )
 
-            if quality.get("valid", False):
-                closed_guard = tech_profile.get(
-                    "closed_bar_guard",
-                    {},
+            if quality.get(
+                "valid",
+                False,
+            ):
+                closed_guard = (
+                    raw_tech_profile.get(
+                        "closed_bar_guard",
+                        {},
+                    )
                 )
 
                 print(
@@ -313,7 +357,9 @@ def main() -> None:
                     f"monthly={closed_guard.get('monthly_closed_rows')}"
                 )
 
-            fund_row = indexed.loc[symbol]
+            fund_row = indexed.loc[
+                symbol
+            ]
 
             if isinstance(
                 fund_row,
@@ -329,9 +375,11 @@ def main() -> None:
                 )
             )
 
-            aliases = _company_aliases(
-                fund_row,
-                market["instrument"],
+            aliases = (
+                _company_aliases(
+                    fund_row,
+                    market["instrument"],
+                )
             )
 
             company_name = (
@@ -358,8 +406,8 @@ def main() -> None:
                 f"type={event_profile.get('event_type')}"
             )
 
-            corporate_guard = (
-                tech_profile.get(
+            raw_corporate_guard = (
+                raw_tech_profile.get(
                     "corporate_action_guard",
                     {},
                 )
@@ -368,7 +416,7 @@ def main() -> None:
             historical_ca = (
                 fetch_historical_actions_for_discontinuities(
                     symbol=symbol,
-                    corporate_action_guard=corporate_guard,
+                    corporate_action_guard=raw_corporate_guard,
                 )
             )
 
@@ -386,19 +434,11 @@ def main() -> None:
             corporate_action_reconciliation = (
                 reconcile_corporate_action_guard(
                     symbol=symbol,
-                    corporate_action_guard=corporate_guard,
+                    corporate_action_guard=raw_corporate_guard,
                     event_profile=event_profile,
                     historical_action_result=historical_ca,
                 )
             )
-
-            tech_profile[
-                "historical_corporate_actions"
-            ] = historical_ca
-
-            tech_profile[
-                "corporate_action_reconciliation"
-            ] = corporate_action_reconciliation
 
             print(
                 f"{symbol}: corporate-action reconciliation "
@@ -417,10 +457,151 @@ def main() -> None:
                 f"{corporate_action_reconciliation.get('unverified_count')}"
             )
 
+            adjusted_market = (
+                build_adjusted_market_views(
+                    market,
+                    corporate_action_reconciliation,
+                )
+            )
+
+            adjustment_metadata = (
+                adjusted_market[
+                    "metadata"
+                ]
+            )
+
+            analysis_tech_profile = (
+                raw_tech_profile
+            )
+            analysis_series = (
+                "raw_guarded"
+            )
+            adjustment_accepted = False
+            residual_discontinuity = None
+
+            if (
+                quality.get(
+                    "valid",
+                    False,
+                )
+                and adjusted_market.get(
+                    "applied",
+                    False,
+                )
+            ):
+                candidate_adjusted_profile = (
+                    _build_smc_profile(
+                        adjusted_market,
+                        quality,
+                    )
+                )
+
+                adjusted_guard = (
+                    candidate_adjusted_profile.get(
+                        "corporate_action_guard",
+                        {},
+                    )
+                )
+
+                residual_discontinuity = bool(
+                    adjusted_guard.get(
+                        "detected",
+                        False,
+                    )
+                )
+
+                if not residual_discontinuity:
+                    analysis_tech_profile = (
+                        candidate_adjusted_profile
+                    )
+                    analysis_series = (
+                        "corporate_action_adjusted"
+                    )
+                    adjustment_accepted = True
+                else:
+                    analysis_series = (
+                        "raw_guarded_fallback"
+                    )
+                    adjustment_metadata[
+                        "warnings"
+                    ].append(
+                        "Adjusted SMC still detected a suspicious price "
+                        "discontinuity. Raw guarded SMC profile was retained."
+                    )
+
+            adjustment_metadata[
+                "accepted_for_smc"
+            ] = adjustment_accepted
+
+            adjustment_metadata[
+                "analysis_series"
+            ] = analysis_series
+
+            adjustment_metadata[
+                "residual_discontinuity_after_adjustment"
+            ] = residual_discontinuity
+
+            adjustment_metadata[
+                "raw_discontinuity_detected"
+            ] = bool(
+                raw_corporate_guard.get(
+                    "detected",
+                    False,
+                )
+            )
+
+            analysis_tech_profile[
+                "analysis_series"
+            ] = analysis_series
+
+            analysis_tech_profile[
+                "price_adjustment"
+            ] = adjustment_metadata
+
+            analysis_tech_profile[
+                "raw_corporate_action_guard"
+            ] = raw_corporate_guard
+
+            analysis_tech_profile[
+                "historical_corporate_actions"
+            ] = historical_ca
+
+            analysis_tech_profile[
+                "corporate_action_reconciliation"
+            ] = (
+                corporate_action_reconciliation
+            )
+
+            print(
+                f"{symbol}: price-series analysis "
+                f"series={analysis_series} | "
+                f"adjustment_applied={adjusted_market.get('applied')} | "
+                f"accepted_for_smc={adjustment_accepted} | "
+                f"source_rows_adjusted="
+                f"{adjustment_metadata.get('total_source_rows_price_adjusted', 0)} | "
+                f"residual_discontinuity={residual_discontinuity}"
+            )
+
+            if adjustment_accepted:
+                adjusted_closed_guard = (
+                    analysis_tech_profile.get(
+                        "closed_bar_guard",
+                        {},
+                    )
+                )
+
+                print(
+                    f"{symbol}: adjusted SMC history "
+                    f"daily={analysis_tech_profile.get('daily_analysis_rows')} | "
+                    f"weekly={analysis_tech_profile.get('weekly_analysis_rows')} | "
+                    f"monthly={analysis_tech_profile.get('monthly_analysis_rows')} | "
+                    f"closed_daily={adjusted_closed_guard.get('daily_closed_rows')}"
+                )
+
             result = evaluate_candidate(
                 symbol,
                 fund_profile,
-                tech_profile,
+                analysis_tech_profile,
                 event_profile,
             )
 
@@ -444,7 +625,17 @@ def main() -> None:
 
             result[
                 "corporate_action_reconciliation"
-            ] = corporate_action_reconciliation
+            ] = (
+                corporate_action_reconciliation
+            )
+
+            result[
+                "price_adjustment"
+            ] = adjustment_metadata
+
+            result[
+                "analysis_series"
+            ] = analysis_series
 
             if quality.get(
                 "valid",
@@ -452,7 +643,7 @@ def main() -> None:
             ):
                 result[
                     "technical_profile"
-                ] = tech_profile
+                ] = analysis_tech_profile
 
             results.append(
                 result
