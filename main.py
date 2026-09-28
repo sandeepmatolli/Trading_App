@@ -182,7 +182,11 @@ def main() -> None:
 
     if requested:
         available = set(all_symbols)
-        unknown = [symbol for symbol in requested if symbol not in available]
+        unknown = [
+            symbol
+            for symbol in requested
+            if symbol not in available
+        ]
 
         if unknown:
             print(
@@ -190,7 +194,11 @@ def main() -> None:
                 f"{unknown}"
             )
 
-        symbols = [symbol for symbol in requested if symbol in available]
+        symbols = [
+            symbol
+            for symbol in requested
+            if symbol in available
+        ]
     else:
         symbols = all_symbols[: args.max_symbols]
 
@@ -205,6 +213,9 @@ def main() -> None:
     from news.news_engine import (
         event_profile_for_symbol,
         fetch_nse_announcements,
+    )
+    from news.nse_historical_corporate_actions import (
+        fetch_historical_actions_for_discontinuities,
     )
 
     groww = get_groww_api()
@@ -237,7 +248,10 @@ def main() -> None:
             )
         )
         .dropna(subset=["__nse"])
-        .drop_duplicates(subset=["__nse"], keep="first")
+        .drop_duplicates(
+            subset=["__nse"],
+            keep="first",
+        )
         .set_index("__nse")
     )
 
@@ -277,13 +291,16 @@ def main() -> None:
                     data_quality=quality,
                 )
             else:
-                tech_profile = {"data_quality": quality}
+                tech_profile = {
+                    "data_quality": quality
+                }
 
             if quality.get("valid", False):
                 closed_guard = tech_profile.get(
                     "closed_bar_guard",
                     {},
                 )
+
                 print(
                     f"{symbol}: SMC closed bars "
                     f"daily={closed_guard.get('daily_closed_rows')}/"
@@ -298,26 +315,38 @@ def main() -> None:
 
             fund_row = indexed.loc[symbol]
 
-            if isinstance(fund_row, pd.DataFrame):
-                fund_row = fund_row.iloc[0]
+            if isinstance(
+                fund_row,
+                pd.DataFrame,
+            ):
+                fund_row = (
+                    fund_row.iloc[0]
+                )
 
-            fund_profile = _fundamental_profile(fund_row)
+            fund_profile = (
+                _fundamental_profile(
+                    fund_row
+                )
+            )
 
             aliases = _company_aliases(
                 fund_row,
                 market["instrument"],
             )
+
             company_name = (
                 aliases[0]
                 if aliases
                 else ""
             )
 
-            event_profile = event_profile_for_symbol(
-                symbol,
-                news_bundle,
-                company_name=company_name,
-                aliases=aliases,
+            event_profile = (
+                event_profile_for_symbol(
+                    symbol,
+                    news_bundle,
+                    company_name=company_name,
+                    aliases=aliases,
+                )
             )
 
             print(
@@ -329,16 +358,43 @@ def main() -> None:
                 f"type={event_profile.get('event_type')}"
             )
 
+            corporate_guard = (
+                tech_profile.get(
+                    "corporate_action_guard",
+                    {},
+                )
+            )
+
+            historical_ca = (
+                fetch_historical_actions_for_discontinuities(
+                    symbol=symbol,
+                    corporate_action_guard=corporate_guard,
+                )
+            )
+
+            if historical_ca.get(
+                "requested"
+            ):
+                print(
+                    f"{symbol}: historical NSE corporate actions "
+                    f"status={historical_ca.get('status')} | "
+                    f"available={historical_ca.get('available')} | "
+                    f"complete={historical_ca.get('complete')} | "
+                    f"actions={len(historical_ca.get('actions', []))}"
+                )
+
             corporate_action_reconciliation = (
                 reconcile_corporate_action_guard(
                     symbol=symbol,
-                    corporate_action_guard=tech_profile.get(
-                        "corporate_action_guard",
-                        {},
-                    ),
+                    corporate_action_guard=corporate_guard,
                     event_profile=event_profile,
+                    historical_action_result=historical_ca,
                 )
             )
+
+            tech_profile[
+                "historical_corporate_actions"
+            ] = historical_ca
 
             tech_profile[
                 "corporate_action_reconciliation"
@@ -351,6 +407,8 @@ def main() -> None:
                 f"{corporate_action_reconciliation.get('discontinuity_count')} | "
                 f"official_actions="
                 f"{corporate_action_reconciliation.get('official_action_candidate_count')} | "
+                f"historical_actions="
+                f"{corporate_action_reconciliation.get('historical_action_candidate_count')} | "
                 f"confirmed="
                 f"{corporate_action_reconciliation.get('confirmed_count')} | "
                 f"probable="
@@ -366,21 +424,45 @@ def main() -> None:
                 event_profile,
             )
 
-            result["market_data_quality"] = quality
-            result["instrument"] = market["instrument"]
-            result["event_profile"] = event_profile
+            result[
+                "market_data_quality"
+            ] = quality
+
+            result[
+                "instrument"
+            ] = market[
+                "instrument"
+            ]
+
+            result[
+                "event_profile"
+            ] = event_profile
+
+            result[
+                "historical_corporate_actions"
+            ] = historical_ca
+
             result[
                 "corporate_action_reconciliation"
             ] = corporate_action_reconciliation
 
-            if quality.get("valid", False):
-                result["technical_profile"] = tech_profile
+            if quality.get(
+                "valid",
+                False,
+            ):
+                result[
+                    "technical_profile"
+                ] = tech_profile
 
-            results.append(result)
+            results.append(
+                result
+            )
 
-            historical_warnings = result.get(
-                "historical_warnings",
-                [],
+            historical_warnings = (
+                result.get(
+                    "historical_warnings",
+                    [],
+                )
             )
 
             print(
@@ -391,47 +473,71 @@ def main() -> None:
             )
 
             for warning in historical_warnings:
-                print(f"  Historical data warning: {warning}")
+                print(
+                    "  Historical data warning: "
+                    + warning
+                )
 
         except Exception as exc:
-            print(f"Failed processing {symbol}: {exc}")
+            print(
+                f"Failed processing {symbol}: {exc}"
+            )
 
             results.append(
                 {
                     "symbol": symbol,
                     "decision": "DATA_REJECT",
                     "positive_evidence": [],
-                    "risk_flags": [f"Pipeline error: {exc}"],
+                    "risk_flags": [
+                        f"Pipeline error: {exc}"
+                    ],
                     "missing_data": [],
                     "historical_warnings": [],
                     "historical_context_degraded": False,
                     "candidate_eligibility_reason": [
                         "Pipeline execution failed before candidate "
-                        "evaluation: " + str(exc)
+                        "evaluation: "
+                        + str(exc)
                     ],
                 }
             )
 
-    destination = _save_results(results)
+    destination = _save_results(
+        results
+    )
 
     candidates = [
         item
         for item in results
-        if item.get("decision") == "CANDIDATE"
+        if item.get(
+            "decision"
+        )
+        == "CANDIDATE"
     ]
 
-    print("\nFinal research shortlist:")
+    print(
+        "\nFinal research shortlist:"
+    )
 
     if not candidates:
-        print("No CANDIDATE setups in this run.")
+        print(
+            "No CANDIDATE setups in this run."
+        )
     else:
         for item in candidates:
             print(
                 f"- {item['symbol']}: "
-                + "; ".join(item["positive_evidence"])
+                + "; ".join(
+                    item[
+                        "positive_evidence"
+                    ]
+                )
             )
 
-    print("Full run output saved to: " f"{destination}")
+    print(
+        "Full run output saved to: "
+        f"{destination}"
+    )
 
 
 if __name__ == "__main__":

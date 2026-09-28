@@ -8,27 +8,21 @@ from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# Reuse the same broad engineering tolerance used by the SMC discontinuity
-# hint. This is deliberately conservative and is not claimed to be optimized.
 DEFAULT_FACTOR_RELATIVE_TOLERANCE = 0.08
-
-# A labelled official action date should land very close to the price-regime
-# boundary. NSE cash actions can interact with holidays/weekends, so allow a
-# small calendar-day window instead of requiring an exact same-date match.
 DEFAULT_ACTION_DATE_TOLERANCE_DAYS = 4
-
-# When the RSS text contains no labelled record/ex/effective date, publication
-# time is weaker evidence. A matching factor plus publication near the boundary
-# can be surfaced as PROBABLE, but never CONFIRMED.
 DEFAULT_PUBLICATION_LOOKBACK_DAYS = 60
 DEFAULT_PUBLICATION_FORWARD_DAYS = 7
 
 OFFICIAL_NSE_SOURCE_IDS = {
     "nse_announcements",
     "nse_corporate_actions",
+    "nse_historical_corporate_actions",
 }
 
-STRONG_CORPORATE_ACTION_SOURCE_ID = "nse_corporate_actions"
+STRONG_CORPORATE_ACTION_SOURCE_IDS = {
+    "nse_corporate_actions",
+    "nse_historical_corporate_actions",
+}
 
 ACTION_DATE_LABELS = (
     "record date",
@@ -84,13 +78,21 @@ def _as_ist_datetime(value) -> Optional[datetime]:
 
 
 def _parse_date_text(value: str) -> Optional[datetime]:
-    raw = re.sub(r"\s+", " ", str(value or "").strip())
+    raw = re.sub(
+        r"\s+",
+        " ",
+        str(value or "").strip(),
+    )
+
     if not raw:
         return None
 
     for fmt in DATE_FORMATS:
         try:
-            return datetime.strptime(raw, fmt).replace(tzinfo=IST)
+            return datetime.strptime(
+                raw,
+                fmt,
+            ).replace(tzinfo=IST)
         except Exception:
             continue
 
@@ -101,11 +103,6 @@ def extract_labeled_action_dates(
     title: str,
     summary: str = "",
 ) -> List[Dict]:
-    """
-    Extract only dates that are explicitly labelled as record/ex/effective
-    dates. Generic dates are intentionally ignored because a filing can contain
-    board-meeting dates, result-period dates, historical references, etc.
-    """
     text = re.sub(
         r"\s+",
         " ",
@@ -119,7 +116,9 @@ def extract_labeled_action_dates(
     seen = set()
 
     for label in ACTION_DATE_LABELS:
-        label_pattern = re.escape(label)
+        label_pattern = re.escape(
+            label
+        )
 
         for date_pattern in DATE_PATTERNS:
             pattern = (
@@ -128,8 +127,14 @@ def extract_labeled_action_dates(
                 rf"({date_pattern})"
             )
 
-            for match in re.finditer(pattern, text):
-                parsed = _parse_date_text(match.group(2))
+            for match in re.finditer(
+                pattern,
+                text,
+            ):
+                parsed = _parse_date_text(
+                    match.group(2)
+                )
+
                 if parsed is None:
                     continue
 
@@ -137,10 +142,12 @@ def extract_labeled_action_dates(
                     match.group(1).lower(),
                     parsed.date().isoformat(),
                 )
+
                 if key in seen:
                     continue
 
                 seen.add(key)
+
                 matches.append(
                     {
                         "label": match.group(1),
@@ -158,40 +165,60 @@ def _relative_error(
     if observed <= 0 or expected <= 0:
         return None
 
-    return abs(observed - expected) / expected
+    return (
+        abs(observed - expected)
+        / expected
+    )
 
 
 def _best_observed_factor(
     discontinuity: Dict,
     official_factor: float,
-) -> Tuple[Optional[float], Optional[str], Optional[float]]:
-    candidates: List[Tuple[str, float]] = []
+) -> Tuple[
+    Optional[float],
+    Optional[str],
+    Optional[float],
+]:
+    candidates: List[
+        Tuple[str, float]
+    ] = []
 
     for key in (
         "open_ratio",
         "close_ratio",
         "matched_common_ratio",
     ):
-        value = discontinuity.get(key)
+        value = discontinuity.get(
+            key
+        )
+
         try:
             numeric = float(value)
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             continue
 
         if numeric > 0:
-            candidates.append((key, numeric))
+            candidates.append(
+                (key, numeric)
+            )
 
     if not candidates:
         return None, None, None
 
     ranked = []
+
     for key, value in candidates:
         error = _relative_error(
             value,
             official_factor,
         )
+
         if error is None:
             continue
+
         ranked.append(
             (
                 error,
@@ -219,8 +246,11 @@ def _boundary_datetime(
         "previous_ts",
     ):
         parsed = _as_ist_datetime(
-            discontinuity.get(key)
+            discontinuity.get(
+                key
+            )
         )
+
         if parsed is not None:
             return parsed
 
@@ -232,7 +262,10 @@ def _date_distance_days(
     right: datetime,
 ) -> int:
     return abs(
-        (left.date() - right.date()).days
+        (
+            left.date()
+            - right.date()
+        ).days
     )
 
 
@@ -254,31 +287,56 @@ def _publication_compatible(
     )
 
 
-def _official_action_candidates(
-    event_profile: Dict,
+def _normalized_action_dates(
+    action: Dict,
 ) -> List[Dict]:
-    """
-    Event profile is already symbol-scoped by news_engine.py.
+    explicit = action.get(
+        "action_dates",
+        [],
+    )
 
-    Prefer the parsed `corporate_actions` list because it contains only events
-    where a bonus/split-style factor was extracted. Do not infer a factor from
-    dividends/rights/general filings.
-    """
-    actions = []
+    if explicit:
+        return [
+            dict(item)
+            for item in explicit
+            if isinstance(
+                item,
+                dict,
+            )
+        ]
 
-    for action in (
-        event_profile.get(
-            "corporate_actions",
-            [],
-        )
-        or []
-    ):
+    return extract_labeled_action_dates(
+        action.get(
+            "title",
+            action.get(
+                "purpose",
+                "",
+            ),
+        ),
+        action.get(
+            "summary",
+            "",
+        ),
+    )
+
+
+def _append_factor_actions(
+    destination: List[Dict],
+    actions: Iterable[Dict],
+) -> None:
+    for action in actions or []:
         source_id = str(
-            action.get("source_id", "")
+            action.get(
+                "source_id",
+                "",
+            )
             or ""
         )
 
-        if source_id not in OFFICIAL_NSE_SOURCE_IDS:
+        if (
+            source_id
+            not in OFFICIAL_NSE_SOURCE_IDS
+        ):
             continue
 
         try:
@@ -287,26 +345,135 @@ def _official_action_candidates(
                     "theoretical_price_factor"
                 )
             )
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             continue
 
         if factor <= 0:
             continue
 
-        enriched = dict(action)
+        enriched = dict(
+            action
+        )
+
         enriched[
             "theoretical_price_factor"
         ] = factor
-        enriched["action_dates"] = (
-            extract_labeled_action_dates(
-                action.get("title", ""),
-                action.get("summary", ""),
-            )
+
+        enriched[
+            "action_dates"
+        ] = _normalized_action_dates(
+            enriched
         )
 
-        actions.append(enriched)
+        if not enriched.get(
+            "title"
+        ):
+            enriched["title"] = str(
+                enriched.get(
+                    "purpose",
+                    "",
+                )
+            )
 
-    return actions
+        destination.append(
+            enriched
+        )
+
+
+def _official_action_candidates(
+    event_profile: Dict,
+    historical_action_result: Optional[
+        Dict
+    ] = None,
+) -> List[Dict]:
+    actions: List[Dict] = []
+
+    _append_factor_actions(
+        actions,
+        event_profile.get(
+            "corporate_actions",
+            [],
+        )
+        or [],
+    )
+
+    historical = (
+        historical_action_result
+        if isinstance(
+            historical_action_result,
+            dict,
+        )
+        else {}
+    )
+
+    _append_factor_actions(
+        actions,
+        historical.get(
+            "actions",
+            [],
+        )
+        or [],
+    )
+
+    seen = set()
+    deduped = []
+
+    for action in actions:
+        key = (
+            action.get(
+                "source_id"
+            ),
+            str(
+                action.get(
+                    "title",
+                    "",
+                )
+            ).strip().lower(),
+            tuple(
+                sorted(
+                    (
+                        str(
+                            item.get(
+                                "label",
+                                "",
+                            )
+                        ).lower(),
+                        str(
+                            item.get(
+                                "date",
+                                "",
+                            )
+                        ),
+                    )
+                    for item in action.get(
+                        "action_dates",
+                        [],
+                    )
+                    if isinstance(
+                        item,
+                        dict,
+                    )
+                )
+            ),
+            action.get(
+                "theoretical_price_factor"
+            ),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(
+            key
+        )
+        deduped.append(
+            action
+        )
+
+    return deduped
 
 
 def _score_candidate(
@@ -323,46 +490,61 @@ def _score_candidate(
     )
 
     official_factor = float(
-        action["theoretical_price_factor"]
+        action[
+            "theoretical_price_factor"
+        ]
     )
 
-    observed_factor, observed_factor_field, factor_error = (
-        _best_observed_factor(
-            discontinuity,
-            official_factor,
-        )
+    (
+        observed_factor,
+        observed_factor_field,
+        factor_error,
+    ) = _best_observed_factor(
+        discontinuity,
+        official_factor,
     )
 
     factor_compatible = bool(
         factor_error is not None
-        and factor_error <= factor_tolerance
+        and factor_error
+        <= factor_tolerance
     )
 
-    labelled_dates = action.get(
-        "action_dates",
-        [],
-    ) or []
+    labelled_dates = (
+        action.get(
+            "action_dates",
+            [],
+        )
+        or []
+    )
 
     date_matches: List[Dict] = []
 
     if boundary is not None:
         for date_item in labelled_dates:
             parsed = _parse_date_text(
-                date_item.get("date", "")
+                date_item.get(
+                    "date",
+                    "",
+                )
             )
 
             if parsed is None:
                 continue
 
-            distance = _date_distance_days(
-                parsed,
-                boundary,
+            distance = (
+                _date_distance_days(
+                    parsed,
+                    boundary,
+                )
             )
 
             date_matches.append(
                 {
                     **date_item,
-                    "distance_days": distance,
+                    "distance_days": (
+                        distance
+                    ),
                     "compatible": (
                         distance
                         <= action_date_tolerance_days
@@ -370,13 +552,21 @@ def _score_candidate(
                 }
             )
 
-    labelled_date_compatible = any(
-        item.get("compatible")
-        for item in date_matches
+    labelled_date_compatible = (
+        any(
+            item.get(
+                "compatible"
+            )
+            for item in date_matches
+        )
     )
 
-    publication = _as_ist_datetime(
-        action.get("published_at")
+    publication = (
+        _as_ist_datetime(
+            action.get(
+                "published_at"
+            )
+        )
     )
 
     publication_compatible = bool(
@@ -385,19 +575,26 @@ def _score_candidate(
         and _publication_compatible(
             publication,
             boundary,
-            lookback_days=publication_lookback_days,
-            forward_days=publication_forward_days,
+            lookback_days=(
+                publication_lookback_days
+            ),
+            forward_days=(
+                publication_forward_days
+            ),
         )
     )
 
     source_id = str(
-        action.get("source_id", "")
+        action.get(
+            "source_id",
+            "",
+        )
         or ""
     )
 
     strong_source = (
         source_id
-        == STRONG_CORPORATE_ACTION_SOURCE_ID
+        in STRONG_CORPORATE_ACTION_SOURCE_IDS
     )
 
     if (
@@ -408,10 +605,11 @@ def _score_candidate(
         status = "CONFIRMED"
         confidence = "HIGH"
         reason = (
-            "Official NSE Corporate Actions evidence has a compatible "
-            "bonus/split factor and a labelled action date near the SMC "
-            "price-discontinuity boundary."
+            "Official NSE corporate-action evidence has a compatible "
+            "bonus/split factor and a labelled ex/record/effective date "
+            "near the SMC price-discontinuity boundary."
         )
+
     elif (
         factor_compatible
         and labelled_date_compatible
@@ -420,9 +618,10 @@ def _score_candidate(
         confidence = "MEDIUM"
         reason = (
             "Official NSE evidence has a compatible factor and labelled "
-            "action date, but it was not sourced from the dedicated "
-            "Corporate Actions feed."
+            "action date, but it was not sourced from a dedicated "
+            "corporate-actions source."
         )
+
     elif (
         factor_compatible
         and publication_compatible
@@ -430,15 +629,16 @@ def _score_candidate(
         status = "PROBABLE"
         confidence = "MEDIUM"
         reason = (
-            "Official NSE evidence has a compatible factor and was published "
-            "near the discontinuity, but no labelled record/ex/effective "
-            "date was available for strong confirmation."
+            "Official NSE evidence has a compatible factor and was "
+            "published near the discontinuity, but no compatible labelled "
+            "action date was available."
         )
+
     else:
         status = "NO_MATCH"
         confidence = "LOW"
         reason = (
-            "The official action evidence did not satisfy both factor/date "
+            "The official action evidence did not satisfy the factor/date "
             "compatibility requirements."
         )
 
@@ -472,40 +672,65 @@ def _score_candidate(
             else None
         ),
         "observed_factor": observed_factor,
-        "observed_factor_field": observed_factor_field,
-        "official_factor": official_factor,
+        "observed_factor_field": (
+            observed_factor_field
+        ),
+        "official_factor": (
+            official_factor
+        ),
         "factor_relative_error": (
-            round(factor_error, 6)
+            round(
+                factor_error,
+                6,
+            )
             if factor_error is not None
             else None
         ),
         "factor_difference_pct": (
             round(
-                factor_error * 100.0,
+                factor_error
+                * 100.0,
                 4,
             )
             if factor_error is not None
             else None
         ),
-        "factor_compatible": factor_compatible,
-        "labelled_action_dates": date_matches,
-        "labelled_action_date_compatible": labelled_date_compatible,
+        "factor_compatible": (
+            factor_compatible
+        ),
+        "labelled_action_dates": (
+            date_matches
+        ),
+        "labelled_action_date_compatible": (
+            labelled_date_compatible
+        ),
         "publication_at": (
             publication.isoformat()
             if publication is not None
             else None
         ),
-        "publication_compatible": publication_compatible,
+        "publication_compatible": (
+            publication_compatible
+        ),
         "source_id": source_id,
+        "source_type": action.get(
+            "source_type"
+        ),
         "action_type": action.get(
             "action_type"
         ),
-        "ratio": action.get("ratio"),
-        "old_face_value": action.get(
-            "old_face_value"
+        "ratio": action.get(
+            "ratio"
         ),
-        "new_face_value": action.get(
-            "new_face_value"
+        "old_face_value": (
+            action.get(
+                "old_face_value"
+            )
+        ),
+        "new_face_value": (
+            action.get(
+                "new_face_value"
+            )
         ),
         "title": action.get(
             "title",
@@ -519,6 +744,12 @@ def _score_candidate(
             "link",
             "",
         ),
+        "ex_date": action.get(
+            "ex_date"
+        ),
+        "record_date": action.get(
+            "record_date"
+        ),
     }
 
 
@@ -526,26 +757,35 @@ def reconcile_corporate_action_guard(
     symbol: str,
     corporate_action_guard: Optional[Dict],
     event_profile: Optional[Dict],
+    historical_action_result: Optional[
+        Dict
+    ] = None,
     *,
-    factor_tolerance: float = DEFAULT_FACTOR_RELATIVE_TOLERANCE,
-    action_date_tolerance_days: int = DEFAULT_ACTION_DATE_TOLERANCE_DAYS,
-    publication_lookback_days: int = DEFAULT_PUBLICATION_LOOKBACK_DAYS,
-    publication_forward_days: int = DEFAULT_PUBLICATION_FORWARD_DAYS,
+    factor_tolerance: float = (
+        DEFAULT_FACTOR_RELATIVE_TOLERANCE
+    ),
+    action_date_tolerance_days: int = (
+        DEFAULT_ACTION_DATE_TOLERANCE_DAYS
+    ),
+    publication_lookback_days: int = (
+        DEFAULT_PUBLICATION_LOOKBACK_DAYS
+    ),
+    publication_forward_days: int = (
+        DEFAULT_PUBLICATION_FORWARD_DAYS
+    ),
 ) -> Dict:
     """
-    Cross-check SMC price discontinuities with symbol-scoped official NSE
-    corporate-action evidence.
+    Cross-check SMC discontinuities with:
+      1) current official NSE RSS event evidence; and
+      2) boundary-scoped historical official NSE corporate-action evidence.
 
     This function NEVER changes historical candles and NEVER removes the SMC
-    safety truncation. It only adds a confirmation layer.
-
-    Important limitation:
-    current NSE RSS feeds are recent/current feeds. An old discontinuity (for
-    example RELIANCE in 2024) can remain UNVERIFIED when that historical action
-    is no longer present in the current feed window. That must not be converted
-    into "not a corporate action".
+    safety truncation.
     """
-    symbol = str(symbol or "").strip().upper()
+    symbol = str(
+        symbol
+        or ""
+    ).strip().upper()
 
     guard = (
         corporate_action_guard
@@ -565,6 +805,15 @@ def reconcile_corporate_action_guard(
         else {}
     )
 
+    historical = (
+        historical_action_result
+        if isinstance(
+            historical_action_result,
+            dict,
+        )
+        else {}
+    )
+
     discontinuities = list(
         guard.get(
             "events",
@@ -573,26 +822,60 @@ def reconcile_corporate_action_guard(
         or []
     )
 
-    actions = _official_action_candidates(
-        profile
+    actions = (
+        _official_action_candidates(
+            profile,
+            historical,
+        )
+    )
+
+    current_action_count = sum(
+        action.get(
+            "source_id"
+        )
+        != "nse_historical_corporate_actions"
+        for action in actions
+    )
+
+    historical_action_count = sum(
+        action.get(
+            "source_id"
+        )
+        == "nse_historical_corporate_actions"
+        for action in actions
     )
 
     base = {
         "symbol": symbol,
         "method": (
-            "official_NSE_corporate_action_factor_date_crosscheck"
+            "official_NSE_current_and_historical_"
+            "corporate_action_factor_date_crosscheck"
         ),
         "changes_price_history": False,
         "smc_guard_preserved": True,
-        "factor_relative_tolerance": factor_tolerance,
-        "action_date_tolerance_days": action_date_tolerance_days,
-        "publication_lookback_days": publication_lookback_days,
-        "publication_forward_days": publication_forward_days,
+        "factor_relative_tolerance": (
+            factor_tolerance
+        ),
+        "action_date_tolerance_days": (
+            action_date_tolerance_days
+        ),
+        "publication_lookback_days": (
+            publication_lookback_days
+        ),
+        "publication_forward_days": (
+            publication_forward_days
+        ),
         "discontinuity_count": len(
             discontinuities
         ),
-        "official_action_candidate_count": len(
-            actions
+        "official_action_candidate_count": (
+            len(actions)
+        ),
+        "current_event_action_candidate_count": (
+            current_action_count
+        ),
+        "historical_action_candidate_count": (
+            historical_action_count
         ),
         "source_available": bool(
             profile.get(
@@ -606,18 +889,48 @@ def reconcile_corporate_action_guard(
                 False,
             )
         ),
-        "feed_window_limitation": (
-            "Current NSE RSS/event-profile evidence may not contain older "
-            "historical corporate actions. NO_MATCH therefore means "
-            "unverified from the currently available official feed evidence, "
-            "not proof that no corporate action occurred."
+        "historical_source_requested": (
+            historical.get(
+                "requested"
+            )
+        ),
+        "historical_source_available": (
+            historical.get(
+                "available"
+            )
+        ),
+        "historical_source_complete": (
+            historical.get(
+                "complete"
+            )
+        ),
+        "historical_source_status": (
+            historical.get(
+                "status"
+            )
+        ),
+        "historical_source_errors": list(
+            historical.get(
+                "errors",
+                [],
+            )
+            or []
+        ),
+        "historical_source_warnings": list(
+            historical.get(
+                "warnings",
+                [],
+            )
+            or []
         ),
     }
 
     if not discontinuities:
         return {
             **base,
-            "status": "NO_DISCONTINUITY",
+            "status": (
+                "NO_DISCONTINUITY"
+            ),
             "confirmed_count": 0,
             "probable_count": 0,
             "unverified_count": 0,
@@ -625,10 +938,21 @@ def reconcile_corporate_action_guard(
             "unverified_discontinuities": [],
         }
 
-    if not actions:
+    if (
+        historical.get(
+            "requested"
+        )
+        and historical.get(
+            "complete"
+        )
+        is False
+        and not actions
+    ):
         return {
             **base,
-            "status": "UNVERIFIED_NO_OFFICIAL_MATCH_IN_CURRENT_FEED",
+            "status": (
+                "UNVERIFIED_HISTORICAL_SOURCE_UNAVAILABLE"
+            ),
             "confirmed_count": 0,
             "probable_count": 0,
             "unverified_count": len(
@@ -646,16 +970,63 @@ def reconcile_corporate_action_guard(
                     "close_ratio": item.get(
                         "close_ratio"
                     ),
-                    "matched_common_ratio": item.get(
-                        "matched_common_ratio"
+                    "matched_common_ratio": (
+                        item.get(
+                            "matched_common_ratio"
+                        )
                     ),
-                    "likely_corporate_action": item.get(
-                        "likely_corporate_action"
+                    "likely_corporate_action": (
+                        item.get(
+                            "likely_corporate_action"
+                        )
                     ),
                     "reason": (
-                        "No parsed bonus/split factor from symbol-matched "
-                        "official NSE corporate-action evidence is available "
-                        "in the current event profile."
+                        "Historical official NSE corporate-action evidence "
+                        "could not be retrieved completely. The existing "
+                        "SMC safety guard remains in force."
+                    ),
+                }
+                for item in discontinuities
+            ],
+        }
+
+    if not actions:
+        return {
+            **base,
+            "status": (
+                "UNVERIFIED_NO_OFFICIAL_MATCH"
+            ),
+            "confirmed_count": 0,
+            "probable_count": 0,
+            "unverified_count": len(
+                discontinuities
+            ),
+            "matches": [],
+            "unverified_discontinuities": [
+                {
+                    "boundary_ts": item.get(
+                        "current_ts"
+                    ),
+                    "open_ratio": item.get(
+                        "open_ratio"
+                    ),
+                    "close_ratio": item.get(
+                        "close_ratio"
+                    ),
+                    "matched_common_ratio": (
+                        item.get(
+                            "matched_common_ratio"
+                        )
+                    ),
+                    "likely_corporate_action": (
+                        item.get(
+                            "likely_corporate_action"
+                        )
+                    ),
+                    "reason": (
+                        "No parsed bonus/split factor from current or "
+                        "historical symbol-matched official NSE "
+                        "corporate-action evidence was available."
                     ),
                 }
                 for item in discontinuities
@@ -670,17 +1041,28 @@ def reconcile_corporate_action_guard(
             _score_candidate(
                 discontinuity,
                 action,
-                factor_tolerance=factor_tolerance,
-                action_date_tolerance_days=action_date_tolerance_days,
-                publication_lookback_days=publication_lookback_days,
-                publication_forward_days=publication_forward_days,
+                factor_tolerance=(
+                    factor_tolerance
+                ),
+                action_date_tolerance_days=(
+                    action_date_tolerance_days
+                ),
+                publication_lookback_days=(
+                    publication_lookback_days
+                ),
+                publication_forward_days=(
+                    publication_forward_days
+                ),
             )
             for action in actions
         ]
 
         candidates.sort(
             key=lambda item: (
-                item.get("score", 0),
+                item.get(
+                    "score",
+                    0,
+                ),
                 -(
                     item.get(
                         "factor_relative_error"
@@ -697,69 +1079,103 @@ def reconcile_corporate_action_guard(
 
         best = candidates[0]
 
-        if best["status"] in {
+        if best[
+            "status"
+        ] in {
             "CONFIRMED",
             "PROBABLE",
         }:
-            matches.append(best)
+            matches.append(
+                best
+            )
+
         else:
+            boundary = (
+                _boundary_datetime(
+                    discontinuity
+                )
+            )
+
             unverified.append(
                 {
                     "boundary_ts": (
-                        _boundary_datetime(
-                            discontinuity
-                        ).isoformat()
-                        if _boundary_datetime(
-                            discontinuity
-                        )
-                        is not None
+                        boundary.isoformat()
+                        if boundary is not None
                         else None
                     ),
-                    "open_ratio": discontinuity.get(
-                        "open_ratio"
+                    "open_ratio": (
+                        discontinuity.get(
+                            "open_ratio"
+                        )
                     ),
-                    "close_ratio": discontinuity.get(
-                        "close_ratio"
+                    "close_ratio": (
+                        discontinuity.get(
+                            "close_ratio"
+                        )
                     ),
-                    "matched_common_ratio": discontinuity.get(
-                        "matched_common_ratio"
+                    "matched_common_ratio": (
+                        discontinuity.get(
+                            "matched_common_ratio"
+                        )
                     ),
-                    "likely_corporate_action": discontinuity.get(
-                        "likely_corporate_action"
+                    "likely_corporate_action": (
+                        discontinuity.get(
+                            "likely_corporate_action"
+                        )
                     ),
-                    "best_official_candidate": best,
+                    "best_official_candidate": (
+                        best
+                    ),
                     "reason": (
                         "Official NSE action evidence was inspected but did "
-                        "not satisfy the confirmation thresholds."
+                        "not satisfy the factor/date confirmation thresholds."
                     ),
                 }
             )
 
     confirmed_count = sum(
-        item["status"] == "CONFIRMED"
+        item[
+            "status"
+        ]
+        == "CONFIRMED"
         for item in matches
     )
 
     probable_count = sum(
-        item["status"] == "PROBABLE"
+        item[
+            "status"
+        ]
+        == "PROBABLE"
         for item in matches
     )
 
     if confirmed_count:
-        overall_status = "CONFIRMED"
+        overall_status = (
+            "CONFIRMED"
+        )
     elif probable_count:
-        overall_status = "PROBABLE"
+        overall_status = (
+            "PROBABLE"
+        )
     else:
-        overall_status = "UNVERIFIED_NO_COMPATIBLE_MATCH"
+        overall_status = (
+            "UNVERIFIED_NO_COMPATIBLE_MATCH"
+        )
 
     return {
         **base,
         "status": overall_status,
-        "confirmed_count": confirmed_count,
-        "probable_count": probable_count,
+        "confirmed_count": (
+            confirmed_count
+        ),
+        "probable_count": (
+            probable_count
+        ),
         "unverified_count": len(
             unverified
         ),
         "matches": matches,
-        "unverified_discontinuities": unverified,
+        "unverified_discontinuities": (
+            unverified
+        ),
     }
