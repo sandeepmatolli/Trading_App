@@ -77,12 +77,34 @@ def _bundle(now):
     }
 
 
+def _install_clock(
+    monkeypatch,
+    now,
+):
+    clock = {"now": now}
+    monkeypatch.setattr(
+        persistent_sources,
+        "_wall_clock_ist",
+        lambda: clock["now"],
+    )
+    monkeypatch.setattr(
+        persistent_sources.time,
+        "sleep",
+        lambda seconds: None,
+    )
+    return clock
+
+
 def test_first_fetch_then_fresh_cache_hit(
     monkeypatch,
     tmp_path,
 ):
     now = datetime.fromisoformat(
         "2026-09-28T14:00:00+05:30"
+    )
+    clock = _install_clock(
+        monkeypatch,
+        now,
     )
     cache = EventCache(
         tmp_path / "cache.db"
@@ -104,6 +126,8 @@ def test_first_fetch_then_fresh_cache_hit(
         cache=cache,
         refresh_minutes=15,
     )
+
+    clock["now"] = now + timedelta(minutes=5)
     second = persistent_sources.fetch_nse_announcements(
         as_of=now + timedelta(minutes=5),
         cache=cache,
@@ -113,8 +137,12 @@ def test_first_fetch_then_fresh_cache_hit(
     assert len(calls) == 1
     assert first["cache"]["hit"] is False
     assert first["cache"]["refreshed"] is True
+    assert first["source_health"]["attempt_count"] == 1
     assert second["cache"]["hit"] is True
     assert second["cache"]["refreshed"] is False
+    assert second["source_health"]["served_from_cache"] is True
+    assert second["source_health"]["attempt_count"] == 0
+    assert second["source_health"]["origin_attempt_count"] == 1
 
 
 def test_force_refresh_bypasses_fresh_event_cache(
@@ -123,6 +151,10 @@ def test_force_refresh_bypasses_fresh_event_cache(
 ):
     now = datetime.fromisoformat(
         "2026-09-28T14:00:00+05:30"
+    )
+    clock = _install_clock(
+        monkeypatch,
+        now,
     )
     cache = EventCache(
         tmp_path / "cache.db"
@@ -144,6 +176,8 @@ def test_force_refresh_bypasses_fresh_event_cache(
         cache=cache,
         refresh_minutes=15,
     )
+
+    clock["now"] = now + timedelta(minutes=1)
     refreshed = persistent_sources.fetch_nse_announcements(
         as_of=now + timedelta(minutes=1),
         cache=cache,
@@ -175,8 +209,6 @@ def test_event_cache_preserves_cross_source_provenance(
         retrieved_at=now + timedelta(minutes=1),
     )
 
-    # Same link in two different official source families remains two items,
-    # while replaying the same bundle is idempotent.
     assert cache.count_items() == 2
 
 
@@ -195,8 +227,9 @@ def test_event_cache_does_not_use_future_retrieval_for_earlier_as_of(
     )
 
     result = cache.load_fresh_bundle(
-        now=retrieved - timedelta(days=1),
+        now=retrieved + timedelta(minutes=1),
         max_age_minutes=9999,
+        not_after=retrieved - timedelta(days=1),
     )
 
     assert result is None
@@ -211,6 +244,10 @@ def test_stale_event_fallback_is_fail_closed(
     )
     now = datetime.fromisoformat(
         "2026-09-28T14:00:00+05:30"
+    )
+    _install_clock(
+        monkeypatch,
+        now,
     )
     cache = EventCache(
         tmp_path / "cache.db"
@@ -239,3 +276,44 @@ def test_stale_event_fallback_is_fail_closed(
     assert result["candidate_eligible"] is False
     assert result["candidate_blockers"]
     assert result["errors"]
+    assert result["source_health"]["served_from_cache"] is True
+    assert result["source_health"]["attempt_count"] == 3
+    assert result["source_health"]["retried"] is True
+    assert result["source_health"]["last_error"] == "network down"
+
+
+def test_event_source_state_persists_health_telemetry(
+    tmp_path,
+):
+    now = datetime.fromisoformat(
+        "2026-09-28T14:00:00+05:30"
+    )
+    cache = EventCache(
+        tmp_path / "cache.db"
+    )
+    bundle = _bundle(now)
+    bundle["source_health"] = {
+        "served_from_cache": False,
+        "cache_age_seconds": 0.0,
+        "attempt_count": 2,
+        "total_elapsed_ms": 123.4,
+        "last_attempt_at": now.isoformat(),
+        "last_http_status": 503,
+        "last_error": "temporary failure",
+        "last_warning": "retry succeeded",
+        "next_retry_after": None,
+    }
+
+    cache.store_bundle(
+        bundle,
+        retrieved_at=now,
+    )
+
+    state = cache.get_source_state(
+        "nse_announcements"
+    )
+
+    assert state is not None
+    assert state["last_elapsed_ms"] == 123.4
+    assert state["last_http_status"] == 503
+    assert state["served_from_cache"] is False

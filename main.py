@@ -274,6 +274,23 @@ def main() -> None:
         f"age_seconds={news_cache.get('age_seconds')}"
     )
 
+    event_source_health = (
+        news_bundle.get(
+            "source_health",
+            {},
+        )
+    )
+
+    print(
+        "NSE event source health: "
+        f"served_from_cache={event_source_health.get('served_from_cache')} | "
+        f"attempts={event_source_health.get('attempt_count')} | "
+        f"retried={event_source_health.get('retried')} | "
+        f"elapsed_ms={event_source_health.get('total_elapsed_ms')} | "
+        f"last_error={event_source_health.get('last_error')} | "
+        f"next_retry_after={event_source_health.get('next_retry_after')}"
+    )
+
     print(
         "NSE event evidence: "
         f"available={news_bundle.get('available')} | "
@@ -461,6 +478,27 @@ def main() -> None:
                     f"refreshed={historical_cache.get('refreshed')} | "
                     f"complete_reused="
                     f"{historical_cache.get('complete_result_reused')}"
+                )
+
+                historical_source_health = (
+                    historical_ca.get(
+                        "source_health",
+                        {},
+                    )
+                )
+
+                print(
+                    f"{symbol}: historical CA source health "
+                    f"served_from_cache="
+                    f"{historical_source_health.get('served_from_cache')} | "
+                    f"attempts={historical_source_health.get('attempt_count')} | "
+                    f"retried={historical_source_health.get('retried')} | "
+                    f"elapsed_ms="
+                    f"{historical_source_health.get('total_elapsed_ms')} | "
+                    f"last_error="
+                    f"{historical_source_health.get('last_error')} | "
+                    f"next_retry_after="
+                    f"{historical_source_health.get('next_retry_after')}"
                 )
 
             corporate_action_reconciliation = (

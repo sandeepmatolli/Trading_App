@@ -36,6 +36,13 @@ CREATE TABLE IF NOT EXISTS event_source_state (
     timestamped_entry_count INTEGER NOT NULL DEFAULT 0,
     undated_entry_count INTEGER NOT NULL DEFAULT 0,
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_http_status INTEGER,
+    last_elapsed_ms REAL,
+    last_error TEXT,
+    last_warning TEXT,
+    next_retry_after TEXT,
+    served_from_cache INTEGER NOT NULL DEFAULT 0,
+    cache_age_seconds REAL,
     errors_json TEXT NOT NULL DEFAULT '[]',
     warnings_json TEXT NOT NULL DEFAULT '[]',
     updated_at TEXT NOT NULL
@@ -110,6 +117,35 @@ def _as_aware_datetime(value) -> Optional[datetime]:
     return parsed
 
 
+def _ensure_source_state_columns(
+    connection,
+) -> None:
+    existing = {
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA table_info(event_source_state)"
+        ).fetchall()
+    }
+
+    additions = {
+        "last_http_status": "INTEGER",
+        "last_elapsed_ms": "REAL",
+        "last_error": "TEXT",
+        "last_warning": "TEXT",
+        "next_retry_after": "TEXT",
+        "served_from_cache": "INTEGER NOT NULL DEFAULT 0",
+        "cache_age_seconds": "REAL",
+    }
+
+    for name, sql_type in additions.items():
+        if name in existing:
+            continue
+        connection.execute(
+            f"ALTER TABLE event_source_state "
+            f"ADD COLUMN {name} {sql_type}"
+        )
+
+
 def _event_key(item: Dict) -> str:
     source_id = str(
         item.get("source_id", "")
@@ -163,6 +199,9 @@ class EventCache:
             connection.executescript(
                 EVENT_SCHEMA
             )
+            _ensure_source_state_columns(
+                connection
+            )
 
     def store_bundle(
         self,
@@ -180,6 +219,21 @@ class EventCache:
         clean_bundle.pop(
             "cache",
             None,
+        )
+
+        source_health = (
+            clean_bundle.get(
+                "source_health",
+                {},
+            )
+            if isinstance(
+                clean_bundle.get(
+                    "source_health",
+                    {},
+                ),
+                dict,
+            )
+            else {}
         )
 
         with cache_connection(
@@ -246,6 +300,43 @@ class EventCache:
                 else:
                     last_success_at = None
 
+                source_errors = list(
+                    source.get(
+                        "errors",
+                        [],
+                    )
+                    or []
+                )
+                source_warnings = list(
+                    source.get(
+                        "warnings",
+                        [],
+                    )
+                    or []
+                )
+
+                last_error = (
+                    str(source_errors[-1])
+                    if source_errors
+                    else source_health.get(
+                        "last_error"
+                    )
+                )
+                last_warning = (
+                    str(source_warnings[-1])
+                    if source_warnings
+                    else source_health.get(
+                        "last_warning"
+                    )
+                )
+
+                last_attempt_at = (
+                    source_health.get(
+                        "last_attempt_at"
+                    )
+                    or retrieved_text
+                )
+
                 connection.execute(
                     """
                     INSERT INTO event_source_state (
@@ -263,10 +354,17 @@ class EventCache:
                         timestamped_entry_count,
                         undated_entry_count,
                         consecutive_failures,
+                        last_http_status,
+                        last_elapsed_ms,
+                        last_error,
+                        last_warning,
+                        next_retry_after,
+                        served_from_cache,
+                        cache_age_seconds,
                         errors_json,
                         warnings_json,
                         updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(source_id) DO UPDATE SET
                         source_type = excluded.source_type,
                         source_url = excluded.source_url,
@@ -281,6 +379,13 @@ class EventCache:
                         timestamped_entry_count = excluded.timestamped_entry_count,
                         undated_entry_count = excluded.undated_entry_count,
                         consecutive_failures = excluded.consecutive_failures,
+                        last_http_status = excluded.last_http_status,
+                        last_elapsed_ms = excluded.last_elapsed_ms,
+                        last_error = excluded.last_error,
+                        last_warning = excluded.last_warning,
+                        next_retry_after = excluded.next_retry_after,
+                        served_from_cache = excluded.served_from_cache,
+                        cache_age_seconds = excluded.cache_age_seconds,
                         errors_json = excluded.errors_json,
                         warnings_json = excluded.warnings_json,
                         updated_at = excluded.updated_at
@@ -304,7 +409,7 @@ class EventCache:
                         source.get(
                             "reliability"
                         ),
-                        retrieved_text,
+                        last_attempt_at,
                         last_success_at,
                         source.get(
                             "latest_item_at"
@@ -340,19 +445,39 @@ class EventCache:
                             or 0
                         ),
                         consecutive_failures,
-                        _json_dumps(
-                            source.get(
-                                "errors",
-                                [],
+                        source.get(
+                            "http_status",
+                            source_health.get(
+                                "last_http_status"
+                            ),
+                        ),
+                        source.get(
+                            "elapsed_ms",
+                            source_health.get(
+                                "total_elapsed_ms"
+                            ),
+                        ),
+                        last_error,
+                        last_warning,
+                        source_health.get(
+                            "next_retry_after"
+                        ),
+                        int(
+                            bool(
+                                source_health.get(
+                                    "served_from_cache",
+                                    False,
+                                )
                             )
-                            or []
+                        ),
+                        source_health.get(
+                            "cache_age_seconds"
                         ),
                         _json_dumps(
-                            source.get(
-                                "warnings",
-                                [],
-                            )
-                            or []
+                            source_errors
+                        ),
+                        _json_dumps(
+                            source_warnings
                         ),
                         retrieved_text,
                     ),
@@ -539,6 +664,7 @@ class EventCache:
         *,
         now: datetime,
         max_age_minutes: int,
+        not_after: Optional[datetime] = None,
     ) -> Optional[Tuple[Dict, datetime, float]]:
         latest = self.load_latest_bundle()
         if latest is None:
@@ -561,10 +687,18 @@ class EventCache:
         ):
             return None
 
-        # Never allow cache data first retrieved in the future relative to the
-        # requested as_of time. This matters for eventual point-in-time work.
         if retrieved_aware > now_aware:
             return None
+
+        if not_after is not None:
+            cutoff = _as_aware_datetime(
+                not_after
+            )
+            if (
+                cutoff is None
+                or retrieved_aware > cutoff
+            ):
+                return None
 
         age_seconds = (
             now_aware
@@ -581,6 +715,28 @@ class EventCache:
             retrieved_aware,
             age_seconds,
         )
+
+    def mark_cache_serve(
+        self,
+        *,
+        served_at: datetime,
+        age_seconds: float,
+    ) -> None:
+        with cache_connection(
+            self.db_path
+        ) as connection:
+            connection.execute(
+                """
+                UPDATE event_source_state
+                SET served_from_cache = 1,
+                    cache_age_seconds = ?,
+                    updated_at = ?
+                """,
+                (
+                    float(age_seconds),
+                    served_at.isoformat(),
+                ),
+            )
 
     def count_items(self) -> int:
         with cache_connection(
@@ -627,6 +783,11 @@ class EventCache:
         result["required_for_candidate"] = bool(
             result.get(
                 "required_for_candidate"
+            )
+        )
+        result["served_from_cache"] = bool(
+            result.get(
+                "served_from_cache"
             )
         )
         result["errors"] = _json_loads(

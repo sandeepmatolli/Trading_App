@@ -314,6 +314,26 @@ NEWS_CACHE_REFRESH_MINUTES = _get_int(
     15,
 )
 
+NEWS_FETCH_MAX_ATTEMPTS = _get_int(
+    "NEWS_FETCH_MAX_ATTEMPTS",
+    3,
+)
+
+NEWS_FETCH_RETRY_BASE_SECONDS = _get_float(
+    "NEWS_FETCH_RETRY_BASE_SECONDS",
+    0.5,
+)
+
+NEWS_FETCH_RETRY_MAX_SECONDS = _get_float(
+    "NEWS_FETCH_RETRY_MAX_SECONDS",
+    2.0,
+)
+
+NEWS_RETRY_COOLDOWN_MINUTES = _get_int(
+    "NEWS_RETRY_COOLDOWN_MINUTES",
+    5,
+)
+
 
 # ---------------------------------------------------------------------------
 # Historical NSE corporate-action confirmation
@@ -355,6 +375,26 @@ NSE_HISTORICAL_CA_CACHE_ENABLED = _get_bool(
 
 NSE_HISTORICAL_CA_CACHE_REFRESH_DAYS = _get_int(
     "NSE_HISTORICAL_CA_CACHE_REFRESH_DAYS",
+    30,
+)
+
+NSE_HISTORICAL_CA_MAX_ATTEMPTS = _get_int(
+    "NSE_HISTORICAL_CA_MAX_ATTEMPTS",
+    3,
+)
+
+NSE_HISTORICAL_CA_RETRY_BASE_SECONDS = _get_float(
+    "NSE_HISTORICAL_CA_RETRY_BASE_SECONDS",
+    0.75,
+)
+
+NSE_HISTORICAL_CA_RETRY_MAX_SECONDS = _get_float(
+    "NSE_HISTORICAL_CA_RETRY_MAX_SECONDS",
+    3.0,
+)
+
+NSE_HISTORICAL_CA_RETRY_COOLDOWN_MINUTES = _get_int(
+    "NSE_HISTORICAL_CA_RETRY_COOLDOWN_MINUTES",
     30,
 )
 
@@ -402,6 +442,10 @@ if __name__ == "__main__":
     print("News source max stale days:", NEWS_SOURCE_MAX_STALE_DAYS)
     print("News cache enabled:", NEWS_CACHE_ENABLED)
     print("News cache refresh minutes:", NEWS_CACHE_REFRESH_MINUTES)
+    print("News fetch max attempts:", NEWS_FETCH_MAX_ATTEMPTS)
+    print("News retry base seconds:", NEWS_FETCH_RETRY_BASE_SECONDS)
+    print("News retry max seconds:", NEWS_FETCH_RETRY_MAX_SECONDS)
+    print("News retry cooldown minutes:", NEWS_RETRY_COOLDOWN_MINUTES)
     print("Historical CA web endpoint:", NSE_CORPORATE_ACTIONS_API_URL)
     print("Historical CA timeout seconds:", NSE_HISTORICAL_CA_TIMEOUT_SECONDS)
     print("Historical CA padding days:", NSE_HISTORICAL_CA_PADDING_DAYS)
@@ -409,4 +453,17 @@ if __name__ == "__main__":
     print(
         "Historical CA cache refresh days:",
         NSE_HISTORICAL_CA_CACHE_REFRESH_DAYS,
+    )
+    print("Historical CA max attempts:", NSE_HISTORICAL_CA_MAX_ATTEMPTS)
+    print(
+        "Historical CA retry base seconds:",
+        NSE_HISTORICAL_CA_RETRY_BASE_SECONDS,
+    )
+    print(
+        "Historical CA retry max seconds:",
+        NSE_HISTORICAL_CA_RETRY_MAX_SECONDS,
+    )
+    print(
+        "Historical CA retry cooldown minutes:",
+        NSE_HISTORICAL_CA_RETRY_COOLDOWN_MINUTES,
     )

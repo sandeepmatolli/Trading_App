@@ -29,6 +29,16 @@ CREATE TABLE IF NOT EXISTS corporate_action_query_cache (
     complete INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL,
     action_count INTEGER NOT NULL DEFAULT 0,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    total_elapsed_ms REAL,
+    last_attempt_at TEXT,
+    last_http_status INTEGER,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    next_retry_after TEXT,
+    served_from_cache INTEGER NOT NULL DEFAULT 0,
+    cache_age_seconds REAL,
+    updated_at TEXT,
     result_json TEXT NOT NULL
 );
 
@@ -97,6 +107,38 @@ def _as_aware_datetime(value) -> Optional[datetime]:
     return parsed
 
 
+def _ensure_query_cache_columns(
+    connection,
+) -> None:
+    existing = {
+        str(row["name"])
+        for row in connection.execute(
+            "PRAGMA table_info(corporate_action_query_cache)"
+        ).fetchall()
+    }
+
+    additions = {
+        "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+        "total_elapsed_ms": "REAL",
+        "last_attempt_at": "TEXT",
+        "last_http_status": "INTEGER",
+        "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
+        "last_error": "TEXT",
+        "next_retry_after": "TEXT",
+        "served_from_cache": "INTEGER NOT NULL DEFAULT 0",
+        "cache_age_seconds": "REAL",
+        "updated_at": "TEXT",
+    }
+
+    for name, sql_type in additions.items():
+        if name in existing:
+            continue
+        connection.execute(
+            f"ALTER TABLE corporate_action_query_cache "
+            f"ADD COLUMN {name} {sql_type}"
+        )
+
+
 def _action_key(action: Dict) -> str:
     identity = "|".join(
         [
@@ -158,6 +200,9 @@ class CorporateActionCache:
             connection.executescript(
                 CORPORATE_ACTION_SCHEMA
             )
+            _ensure_query_cache_columns(
+                connection
+            )
 
     @staticmethod
     def make_query_key(
@@ -204,6 +249,7 @@ class CorporateActionCache:
         padding_days: int,
         result: Dict,
         retrieved_at: datetime,
+        telemetry: Optional[Dict] = None,
     ) -> None:
         retrieved_text = (
             retrieved_at.isoformat()
@@ -216,9 +262,50 @@ class CorporateActionCache:
             None,
         )
 
+        telemetry_values = (
+            deepcopy(telemetry)
+            if isinstance(
+                telemetry,
+                dict,
+            )
+            else {}
+        )
+
         with cache_connection(
             self.db_path
         ) as connection:
+            existing = connection.execute(
+                """
+                SELECT consecutive_failures
+                FROM corporate_action_query_cache
+                WHERE query_key = ?
+                """,
+                (query_key,),
+            ).fetchone()
+
+            previous_failures = (
+                int(
+                    existing[
+                        "consecutive_failures"
+                    ]
+                )
+                if existing is not None
+                else 0
+            )
+
+            complete = bool(
+                clean_result.get(
+                    "complete",
+                    False,
+                )
+            )
+
+            consecutive_failures = (
+                0
+                if complete
+                else previous_failures + 1
+            )
+
             connection.execute(
                 """
                 INSERT INTO corporate_action_query_cache (
@@ -232,14 +319,34 @@ class CorporateActionCache:
                     complete,
                     status,
                     action_count,
+                    attempt_count,
+                    total_elapsed_ms,
+                    last_attempt_at,
+                    last_http_status,
+                    consecutive_failures,
+                    last_error,
+                    next_retry_after,
+                    served_from_cache,
+                    cache_age_seconds,
+                    updated_at,
                     result_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(query_key) DO UPDATE SET
                     retrieved_at = excluded.retrieved_at,
                     available = excluded.available,
                     complete = excluded.complete,
                     status = excluded.status,
                     action_count = excluded.action_count,
+                    attempt_count = excluded.attempt_count,
+                    total_elapsed_ms = excluded.total_elapsed_ms,
+                    last_attempt_at = excluded.last_attempt_at,
+                    last_http_status = excluded.last_http_status,
+                    consecutive_failures = excluded.consecutive_failures,
+                    last_error = excluded.last_error,
+                    next_retry_after = excluded.next_retry_after,
+                    served_from_cache = excluded.served_from_cache,
+                    cache_age_seconds = excluded.cache_age_seconds,
+                    updated_at = excluded.updated_at,
                     result_json = excluded.result_json
                 """,
                 (
@@ -274,14 +381,7 @@ class CorporateActionCache:
                             )
                         )
                     ),
-                    int(
-                        bool(
-                            clean_result.get(
-                                "complete",
-                                False,
-                            )
-                        )
-                    ),
+                    int(complete),
                     str(
                         clean_result.get(
                             "status",
@@ -301,6 +401,41 @@ class CorporateActionCache:
                         )
                         or 0
                     ),
+                    int(
+                        telemetry_values.get(
+                            "attempt_count",
+                            0,
+                        )
+                        or 0
+                    ),
+                    telemetry_values.get(
+                        "total_elapsed_ms"
+                    ),
+                    telemetry_values.get(
+                        "last_attempt_at"
+                    ),
+                    telemetry_values.get(
+                        "last_http_status"
+                    ),
+                    consecutive_failures,
+                    telemetry_values.get(
+                        "last_error"
+                    ),
+                    telemetry_values.get(
+                        "next_retry_after"
+                    ),
+                    int(
+                        bool(
+                            telemetry_values.get(
+                                "served_from_cache",
+                                False,
+                            )
+                        )
+                    ),
+                    telemetry_values.get(
+                        "cache_age_seconds"
+                    ),
+                    retrieved_text,
                     _json_dumps(
                         clean_result
                     ),
@@ -390,6 +525,7 @@ class CorporateActionCache:
         query_key: str,
         now: datetime,
         max_age_days: int,
+        not_after: Optional[datetime] = None,
     ) -> Optional[Tuple[Dict, datetime, float]]:
         with cache_connection(
             self.db_path
@@ -428,10 +564,18 @@ class CorporateActionCache:
         ):
             return None
 
-        # Prevent future-retrieved cache entries from leaking into a historical
-        # as_of evaluation.
         if retrieved_at > now_aware:
             return None
+
+        if not_after is not None:
+            cutoff = _as_aware_datetime(
+                not_after
+            )
+            if (
+                cutoff is None
+                or retrieved_at > cutoff
+            ):
+                return None
 
         age_seconds = (
             now_aware
@@ -458,6 +602,69 @@ class CorporateActionCache:
             retrieved_at,
             age_seconds,
         )
+
+    def mark_cache_serve(
+        self,
+        *,
+        query_key: str,
+        served_at: datetime,
+        age_seconds: float,
+    ) -> None:
+        with cache_connection(
+            self.db_path
+        ) as connection:
+            connection.execute(
+                """
+                UPDATE corporate_action_query_cache
+                SET served_from_cache = 1,
+                    cache_age_seconds = ?,
+                    updated_at = ?
+                WHERE query_key = ?
+                """,
+                (
+                    float(age_seconds),
+                    served_at.isoformat(),
+                    query_key,
+                ),
+            )
+
+    def get_query_state(
+        self,
+        query_key: str,
+    ) -> Optional[Dict]:
+        with cache_connection(
+            self.db_path
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM corporate_action_query_cache
+                WHERE query_key = ?
+                """,
+                (query_key,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        result = dict(row)
+        result["complete"] = bool(
+            result.get(
+                "complete"
+            )
+        )
+        if result.get("available") is not None:
+            result["available"] = bool(
+                result.get(
+                    "available"
+                )
+            )
+        result["served_from_cache"] = bool(
+            result.get(
+                "served_from_cache"
+            )
+        )
+        return result
 
     def count_actions(self) -> int:
         with cache_connection(

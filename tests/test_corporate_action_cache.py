@@ -65,12 +65,52 @@ def _complete_result(
     }
 
 
+def _incomplete_result(symbol="RELIANCE"):
+    return {
+        "requested": True,
+        "available": False,
+        "complete": False,
+        "status": "UNAVAILABLE",
+        "symbol": symbol,
+        "source_id": "nse_historical_corporate_actions",
+        "source_url": "https://example.test/ca",
+        "boundary_dates": ["2024-10-28"],
+        "windows": [],
+        "actions": [],
+        "action_count": 0,
+        "errors": ["failed"],
+        "warnings": [],
+    }
+
+
+def _install_clock(
+    monkeypatch,
+    now,
+):
+    clock = {"now": now}
+    monkeypatch.setattr(
+        persistent_sources,
+        "_wall_clock_ist",
+        lambda: clock["now"],
+    )
+    monkeypatch.setattr(
+        persistent_sources.time,
+        "sleep",
+        lambda seconds: None,
+    )
+    return clock
+
+
 def test_complete_historical_query_is_reused(
     monkeypatch,
     tmp_path,
 ):
     now = datetime.fromisoformat(
         "2026-09-28T14:00:00+05:30"
+    )
+    clock = _install_clock(
+        monkeypatch,
+        now,
     )
     cache = CorporateActionCache(
         tmp_path / "cache.db"
@@ -96,6 +136,8 @@ def test_complete_historical_query_is_reused(
             refresh_days=30,
         )
     )
+
+    clock["now"] = now + timedelta(days=1)
     second = (
         persistent_sources.fetch_historical_actions_for_discontinuities(
             "RELIANCE",
@@ -112,6 +154,8 @@ def test_complete_historical_query_is_reused(
     assert second["cache"][
         "complete_result_reused"
     ] is True
+    assert second["source_health"]["served_from_cache"] is True
+    assert second["source_health"]["attempt_count"] == 0
 
 
 def test_complete_zero_action_query_is_reused(
@@ -120,6 +164,10 @@ def test_complete_zero_action_query_is_reused(
 ):
     now = datetime.fromisoformat(
         "2026-09-28T14:00:00+05:30"
+    )
+    clock = _install_clock(
+        monkeypatch,
+        now,
     )
     cache = CorporateActionCache(
         tmp_path / "cache.db"
@@ -147,6 +195,8 @@ def test_complete_zero_action_query_is_reused(
             refresh_days=30,
         )
     )
+
+    clock["now"] = now + timedelta(days=1)
     second = (
         persistent_sources.fetch_historical_actions_for_discontinuities(
             "RELIANCE",
@@ -170,6 +220,10 @@ def test_incomplete_historical_query_is_never_reused(
     now = datetime.fromisoformat(
         "2026-09-28T14:00:00+05:30"
     )
+    clock = _install_clock(
+        monkeypatch,
+        now,
+    )
     cache = CorporateActionCache(
         tmp_path / "cache.db"
     )
@@ -177,21 +231,7 @@ def test_incomplete_historical_query_is_never_reused(
 
     def fake_fetch(symbol, guard, **kwargs):
         calls.append(True)
-        return {
-            "requested": True,
-            "available": False,
-            "complete": False,
-            "status": "UNAVAILABLE",
-            "symbol": symbol,
-            "source_id": "nse_historical_corporate_actions",
-            "source_url": "https://example.test/ca",
-            "boundary_dates": ["2024-10-28"],
-            "windows": [],
-            "actions": [],
-            "action_count": 0,
-            "errors": ["failed"],
-            "warnings": [],
-        }
+        return _incomplete_result(symbol)
 
     monkeypatch.setattr(
         persistent_sources,
@@ -199,13 +239,15 @@ def test_incomplete_historical_query_is_never_reused(
         fake_fetch,
     )
 
-    persistent_sources.fetch_historical_actions_for_discontinuities(
+    first = persistent_sources.fetch_historical_actions_for_discontinuities(
         "RELIANCE",
         _guard(),
         as_of=now,
         cache=cache,
         refresh_days=30,
     )
+
+    clock["now"] = now + timedelta(minutes=1)
     second = (
         persistent_sources.fetch_historical_actions_for_discontinuities(
             "RELIANCE",
@@ -216,7 +258,9 @@ def test_incomplete_historical_query_is_never_reused(
         )
     )
 
-    assert len(calls) == 2
+    assert first["source_health"]["attempt_count"] == 3
+    assert second["source_health"]["attempt_count"] == 3
+    assert len(calls) == 6
     assert second["cache"]["hit"] is False
 
 
@@ -226,6 +270,10 @@ def test_historical_cache_expiry_triggers_refresh(
 ):
     now = datetime.fromisoformat(
         "2026-09-28T14:00:00+05:30"
+    )
+    clock = _install_clock(
+        monkeypatch,
+        now,
     )
     cache = CorporateActionCache(
         tmp_path / "cache.db"
@@ -249,6 +297,8 @@ def test_historical_cache_expiry_triggers_refresh(
         cache=cache,
         refresh_days=1,
     )
+
+    clock["now"] = now + timedelta(days=2)
     refreshed = (
         persistent_sources.fetch_historical_actions_for_discontinuities(
             "RELIANCE",
@@ -269,6 +319,10 @@ def test_different_boundary_uses_different_cache_key(
 ):
     now = datetime.fromisoformat(
         "2026-09-28T14:00:00+05:30"
+    )
+    _install_clock(
+        monkeypatch,
+        now,
     )
     cache = CorporateActionCache(
         tmp_path / "cache.db"
@@ -306,3 +360,48 @@ def test_different_boundary_uses_different_cache_key(
 
     assert len(calls) == 2
     assert first["cache"]["query_key"] != second["cache"]["query_key"]
+
+
+def test_historical_query_state_persists_telemetry(
+    tmp_path,
+):
+    now = datetime.fromisoformat(
+        "2026-09-28T14:00:00+05:30"
+    )
+    cache = CorporateActionCache(
+        tmp_path / "cache.db"
+    )
+    key = CorporateActionCache.make_query_key(
+        symbol="RELIANCE",
+        boundary_dates=["2024-10-28"],
+        padding_days=7,
+    )
+
+    cache.store_result(
+        query_key=key,
+        symbol="RELIANCE",
+        boundary_dates=["2024-10-28"],
+        padding_days=7,
+        result=_complete_result(),
+        retrieved_at=now,
+        telemetry={
+            "attempt_count": 2,
+            "total_elapsed_ms": 55.5,
+            "last_attempt_at": now.isoformat(),
+            "last_http_status": 200,
+            "last_error": None,
+            "next_retry_after": None,
+            "served_from_cache": False,
+            "cache_age_seconds": 0.0,
+        },
+    )
+
+    state = cache.get_query_state(
+        key
+    )
+
+    assert state is not None
+    assert state["attempt_count"] == 2
+    assert state["total_elapsed_ms"] == 55.5
+    assert state["last_http_status"] == 200
+    assert state["served_from_cache"] is False
