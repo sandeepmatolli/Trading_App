@@ -178,10 +178,57 @@ MARKET_DATA_CANDIDATE_SETUP_USABLE_EXPECTED_RATIO = _get_float(
 
 
 # ---------------------------------------------------------------------------
-# News / corporate announcements
+# News / official NSE corporate information
+# ---------------------------------------------------------------------------
+#
+# NSE publishes public RSS feeds for corporate information. These URLs remain
+# configurable because exchange infrastructure can change.
+#
+# Required for candidate-grade event evidence:
+#   1) Corporate announcements
+#   2) Corporate actions
+#
+# Financial results and board meetings are fetched as additional context.
+# NEWS_RSS_URLS remains available for optional supplementary RSS feeds, but
+# supplementary sources never replace the required official NSE feeds.
 # ---------------------------------------------------------------------------
 
+NSE_ANNOUNCEMENTS_RSS_URL = os.getenv(
+    "NSE_ANNOUNCEMENTS_RSS_URL",
+    "https://nsearchives.nseindia.com/content/RSS/Online_announcements.xml",
+).strip()
+
+NSE_CORPORATE_ACTIONS_RSS_URL = os.getenv(
+    "NSE_CORPORATE_ACTIONS_RSS_URL",
+    "https://nsearchives.nseindia.com/content/RSS/Corporate_action.xml",
+).strip()
+
+NSE_FINANCIAL_RESULTS_RSS_URL = os.getenv(
+    "NSE_FINANCIAL_RESULTS_RSS_URL",
+    "https://nsearchives.nseindia.com/content/RSS/Financial_Results.xml",
+).strip()
+
+NSE_BOARD_MEETINGS_RSS_URL = os.getenv(
+    "NSE_BOARD_MEETINGS_RSS_URL",
+    "https://nsearchives.nseindia.com/content/RSS/Board_Meetings.xml",
+).strip()
+
 NEWS_RSS_URLS = _get_list("NEWS_RSS_URLS")
+
+NEWS_EVENT_LOOKBACK_DAYS = _get_int(
+    "NEWS_EVENT_LOOKBACK_DAYS",
+    14,
+)
+
+NEWS_SOURCE_MAX_STALE_DAYS = _get_int(
+    "NEWS_SOURCE_MAX_STALE_DAYS",
+    7,
+)
+
+NEWS_MAX_MATCHED_EVENTS = _get_int(
+    "NEWS_MAX_MATCHED_EVENTS",
+    10,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -218,3 +265,7 @@ if __name__ == "__main__":
     print("Recent continuity days:", MARKET_DATA_RECENT_CONTINUITY_DAYS)
     print("75m minimum source bars:", MARKET_DATA_SETUP_MIN_SOURCE_BARS)
     print("75m minimum usable bars:", MARKET_DATA_MIN_SETUP_BARS)
+    print("NSE announcements RSS:", NSE_ANNOUNCEMENTS_RSS_URL)
+    print("NSE corporate actions RSS:", NSE_CORPORATE_ACTIONS_RSS_URL)
+    print("News event lookback days:", NEWS_EVENT_LOOKBACK_DAYS)
+    print("News source max stale days:", NEWS_SOURCE_MAX_STALE_DAYS)

@@ -41,6 +41,46 @@ def _fundamental_profile(
     }
 
 
+def _clean_optional_text(value) -> str:
+    if value is None:
+        return ""
+
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+
+    return str(value).strip()
+
+
+def _company_aliases(
+    row: pd.Series,
+    instrument: Dict,
+) -> List[str]:
+    values: List[str] = []
+
+    for column in (
+        "Name",
+        "Company Name",
+        "Company",
+        "Stock Name",
+    ):
+        text = _clean_optional_text(
+            row.get(column)
+        )
+        if text:
+            values.append(text)
+
+    instrument_name = _clean_optional_text(
+        instrument.get("name")
+    )
+    if instrument_name:
+        values.append(instrument_name)
+
+    return list(dict.fromkeys(values))
+
+
 def _save_results(
     results: List[Dict],
 ) -> Path:
@@ -167,6 +207,23 @@ def main() -> None:
     groww = get_groww_api()
     news_bundle = fetch_nse_announcements()
 
+    print(
+        "NSE event evidence: "
+        f"available={news_bundle.get('available')} | "
+        f"candidate_eligible={news_bundle.get('candidate_eligible')} | "
+        f"items={len(news_bundle.get('items', []))} | "
+        f"blockers={len(news_bundle.get('candidate_blockers', []))}"
+    )
+
+    for source in news_bundle.get("sources", []):
+        print(
+            f"  {source.get('source_id')}: "
+            f"available={source.get('available')} | "
+            f"candidate_eligible={source.get('candidate_eligible')} | "
+            f"entries={source.get('entry_count')} | "
+            f"latest={source.get('latest_item_at')}"
+        )
+
     indexed = (
         df_fund.assign(
             __nse=(
@@ -243,9 +300,30 @@ def main() -> None:
 
             fund_profile = _fundamental_profile(fund_row)
 
+            aliases = _company_aliases(
+                fund_row,
+                market["instrument"],
+            )
+            company_name = (
+                aliases[0]
+                if aliases
+                else ""
+            )
+
             event_profile = event_profile_for_symbol(
                 symbol,
                 news_bundle,
+                company_name=company_name,
+                aliases=aliases,
+            )
+
+            print(
+                f"{symbol}: event evidence "
+                f"available={event_profile.get('available')} | "
+                f"candidate_eligible={event_profile.get('candidate_eligible')} | "
+                f"matches={event_profile.get('event_count')} | "
+                f"sentiment={event_profile.get('sentiment')} | "
+                f"type={event_profile.get('event_type')}"
             )
 
             result = evaluate_candidate(

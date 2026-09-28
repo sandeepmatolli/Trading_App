@@ -47,10 +47,6 @@ def _historical_warnings(
     """
     Return explicit old-history warnings without turning them into
     fundamental/company risk flags.
-
-    The market-data validator already distinguishes recent fatal gaps from
-    older degradable gaps. This helper only makes the older context visible in
-    the final shortlist JSON.
     """
     explicit = data_quality.get("historical_warnings")
     if isinstance(explicit, list) and explicit:
@@ -80,8 +76,6 @@ def _historical_warnings(
     if warnings:
         return warnings
 
-    # Backward-compatible fallback for quality payloads that only expose the
-    # human-readable warnings list.
     for warning in data_quality.get("warnings", []) or []:
         text = str(warning)
         if (
@@ -120,6 +114,13 @@ def evaluate_candidate(
       REJECT      -> explicit material/fundamental risk
       CANDIDATE   -> complete evidence, candidate-grade data, bullish setup
       WATCH       -> incomplete, degraded, or not-yet-confirmed setup
+
+    Event evidence has TWO gates:
+      available          -> the primary official source was reachable
+      candidate_eligible -> required official sources were reachable + fresh
+
+    A source can therefore be available but still be too stale/degraded to
+    permit CANDIDATE.
 
     This function does not place orders.
     """
@@ -245,7 +246,15 @@ def evaluate_candidate(
     if tech_profile.get("daily_choch_bearish"):
         risks.append("Daily bearish CHOCH")
 
-    event_available = bool(event_profile.get("available", False))
+    event_available = bool(
+        event_profile.get("available", False)
+    )
+    event_candidate_eligible = bool(
+        event_profile.get(
+            "candidate_eligible",
+            event_available,
+        )
+    )
 
     if not event_available:
         missing_data.append(
@@ -253,7 +262,27 @@ def evaluate_candidate(
         )
         sentiment = "Unknown"
     else:
-        sentiment = event_profile.get("sentiment", "Neutral")
+        sentiment = event_profile.get(
+            "sentiment",
+            "Neutral",
+        )
+
+        if not event_candidate_eligible:
+            blockers = event_profile.get(
+                "candidate_blockers",
+                [],
+            )
+
+            if blockers:
+                for blocker in blockers:
+                    missing_data.append(
+                        "Event-source candidate gate: "
+                        + str(blocker)
+                    )
+            else:
+                missing_data.append(
+                    "Event source is available but not candidate-grade."
+                )
 
     if sentiment == "Negative":
         risks.append(
@@ -287,7 +316,7 @@ def evaluate_candidate(
     )
 
     evidence_complete = (
-        event_available
+        event_candidate_eligible
         and not is_financial
         and candidate_data_eligible
     )
@@ -308,7 +337,7 @@ def evaluate_candidate(
                 "Daily trend is Bullish.",
                 "Bullish Daily/75m BOS/CHOCH evidence is present.",
                 "No bearish Daily BOS/CHOCH is present.",
-                "News/corporate-announcement evidence is available.",
+                "Official event evidence is available and candidate-grade.",
                 "Generic non-financial fundamental model is applicable.",
             ]
         )
@@ -362,6 +391,11 @@ def evaluate_candidate(
             candidate_eligibility_reason.append(
                 "News/corporate-announcement evidence is unavailable."
             )
+        elif not event_candidate_eligible:
+            candidate_eligibility_reason.append(
+                "Official event evidence is available but not "
+                "candidate-grade/fresh."
+            )
 
         if is_financial:
             candidate_eligibility_reason.append(
@@ -378,4 +412,5 @@ def evaluate_candidate(
         "historical_context_degraded": historical_context_degraded,
         "candidate_eligibility_reason": candidate_eligibility_reason,
         "financial_sector_model_deferred": is_financial,
+        "event_source_candidate_eligible": event_candidate_eligible,
     }

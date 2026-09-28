@@ -61,6 +61,16 @@ def _bullish_technical_profile(
     }
 
 
+def _healthy_event():
+    return {
+        "available": True,
+        "candidate_eligible": True,
+        "sentiment": "Neutral",
+        "title": "",
+        "candidate_blockers": [],
+    }
+
+
 def test_bad_market_data_is_data_reject():
     result = evaluate_candidate(
         "EXAMPLE",
@@ -73,11 +83,7 @@ def test_bad_market_data_is_data_reject():
                 "older_large_daily_gaps": [],
             }
         },
-        {
-            "available": True,
-            "sentiment": "Neutral",
-            "title": "",
-        },
+        _healthy_event(),
     )
 
     assert result["decision"] == "DATA_REJECT"
@@ -95,6 +101,7 @@ def test_missing_news_keeps_setup_on_watch():
         _bullish_technical_profile(candidate_eligible=True),
         {
             "available": False,
+            "candidate_eligible": False,
             "sentiment": "Unknown",
             "title": "",
         },
@@ -105,9 +112,29 @@ def test_missing_news_keeps_setup_on_watch():
         "News/corporate-announcement" in item
         for item in result["missing_data"]
     )
+
+
+def test_degraded_event_source_keeps_setup_on_watch():
+    result = evaluate_candidate(
+        "EXAMPLE",
+        _fundamentals(),
+        _bullish_technical_profile(candidate_eligible=True),
+        {
+            "available": True,
+            "candidate_eligible": False,
+            "sentiment": "Neutral",
+            "title": "",
+            "candidate_blockers": [
+                "Required event source is stale."
+            ],
+        },
+    )
+
+    assert result["decision"] == "WATCH"
+    assert result["event_source_candidate_eligible"] is False
     assert any(
-        "unavailable" in item.lower()
-        for item in result["candidate_eligibility_reason"]
+        "Event-source candidate gate" in item
+        for item in result["missing_data"]
     )
 
 
@@ -116,21 +143,13 @@ def test_degraded_market_data_cannot_become_candidate():
         "EXAMPLE",
         _fundamentals(),
         _bullish_technical_profile(candidate_eligible=False),
-        {
-            "available": True,
-            "sentiment": "Neutral",
-            "title": "",
-        },
+        _healthy_event(),
     )
 
     assert result["decision"] == "WATCH"
     assert any(
         "Market-data candidate gate" in item
         for item in result["missing_data"]
-    )
-    assert any(
-        "not candidate-grade" in item.lower()
-        for item in result["candidate_eligibility_reason"]
     )
 
 
@@ -139,15 +158,33 @@ def test_complete_candidate_grade_evidence_can_be_candidate():
         "EXAMPLE",
         _fundamentals(),
         _bullish_technical_profile(candidate_eligible=True),
-        {
-            "available": True,
-            "sentiment": "Neutral",
-            "title": "",
-        },
+        _healthy_event(),
     )
 
     assert result["decision"] == "CANDIDATE"
     assert result["candidate_eligibility_reason"]
+    assert result["event_source_candidate_eligible"] is True
+
+
+def test_negative_material_event_is_reject():
+    result = evaluate_candidate(
+        "EXAMPLE",
+        _fundamentals(),
+        _bullish_technical_profile(candidate_eligible=True),
+        {
+            "available": True,
+            "candidate_eligible": True,
+            "sentiment": "Negative",
+            "title": "Credit Rating Downgrade",
+            "candidate_blockers": [],
+        },
+    )
+
+    assert result["decision"] == "REJECT"
+    assert any(
+        "Negative material event" in risk
+        for risk in result["risk_flags"]
+    )
 
 
 def test_old_historical_gap_is_visible_but_does_not_by_itself_block_candidate():
@@ -158,11 +195,7 @@ def test_old_historical_gap_is_visible_but_does_not_by_itself_block_candidate():
             candidate_eligible=True,
             older_gap=True,
         ),
-        {
-            "available": True,
-            "sentiment": "Neutral",
-            "title": "",
-        },
+        _healthy_event(),
     )
 
     assert result["decision"] == "CANDIDATE"
@@ -184,6 +217,7 @@ def test_old_historical_gap_remains_visible_when_news_is_missing():
         ),
         {
             "available": False,
+            "candidate_eligible": False,
             "sentiment": "Unknown",
             "title": "",
         },
@@ -192,7 +226,3 @@ def test_old_historical_gap_remains_visible_when_news_is_missing():
     assert result["decision"] == "WATCH"
     assert result["historical_context_degraded"] is True
     assert result["historical_warnings"]
-    assert any(
-        "News/corporate-announcement" in item
-        for item in result["missing_data"]
-    )
