@@ -199,6 +199,9 @@ def main() -> None:
 
     from market_data.groww_auth import get_groww_api
     from market_data.groww_fetch import fetch_market_timeframes
+    from news.corporate_action_reconciliation import (
+        reconcile_corporate_action_guard,
+    )
     from news.news_engine import (
         event_profile_for_symbol,
         fetch_nse_announcements,
@@ -326,6 +329,36 @@ def main() -> None:
                 f"type={event_profile.get('event_type')}"
             )
 
+            corporate_action_reconciliation = (
+                reconcile_corporate_action_guard(
+                    symbol=symbol,
+                    corporate_action_guard=tech_profile.get(
+                        "corporate_action_guard",
+                        {},
+                    ),
+                    event_profile=event_profile,
+                )
+            )
+
+            tech_profile[
+                "corporate_action_reconciliation"
+            ] = corporate_action_reconciliation
+
+            print(
+                f"{symbol}: corporate-action reconciliation "
+                f"status={corporate_action_reconciliation.get('status')} | "
+                f"discontinuities="
+                f"{corporate_action_reconciliation.get('discontinuity_count')} | "
+                f"official_actions="
+                f"{corporate_action_reconciliation.get('official_action_candidate_count')} | "
+                f"confirmed="
+                f"{corporate_action_reconciliation.get('confirmed_count')} | "
+                f"probable="
+                f"{corporate_action_reconciliation.get('probable_count')} | "
+                f"unverified="
+                f"{corporate_action_reconciliation.get('unverified_count')}"
+            )
+
             result = evaluate_candidate(
                 symbol,
                 fund_profile,
@@ -336,6 +369,9 @@ def main() -> None:
             result["market_data_quality"] = quality
             result["instrument"] = market["instrument"]
             result["event_profile"] = event_profile
+            result[
+                "corporate_action_reconciliation"
+            ] = corporate_action_reconciliation
 
             if quality.get("valid", False):
                 result["technical_profile"] = tech_profile
