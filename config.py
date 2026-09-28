@@ -77,22 +77,14 @@ def _resolve_project_path(
     ).strip()
 
     if not value:
-        return (
-            PROJECT_ROOT
-            / default_relative_path
-        )
+        return PROJECT_ROOT / default_relative_path
 
-    candidate = (
-        Path(value).expanduser()
-    )
+    candidate = Path(value).expanduser()
 
     if candidate.is_absolute():
         return candidate
 
-    return (
-        PROJECT_ROOT
-        / candidate
-    )
+    return PROJECT_ROOT / candidate
 
 
 # ---------------------------------------------------------------------------
@@ -131,24 +123,14 @@ GROWW_SEGMENT = os.getenv(
 
 DATA_DIR = PROJECT_ROOT / "data"
 RAW_DATA_DIR = DATA_DIR / "raw"
-PROCESSED_DATA_DIR = (
-    DATA_DIR / "processed"
-)
-MARKET_DATA_DIR = (
-    DATA_DIR / "market"
-)
-OUTPUT_DIR = (
-    DATA_DIR / "output"
-)
-DATABASE_DIR = (
-    DATA_DIR / "database"
-)
+PROCESSED_DATA_DIR = DATA_DIR / "processed"
+MARKET_DATA_DIR = DATA_DIR / "market"
+OUTPUT_DIR = DATA_DIR / "output"
+DATABASE_DIR = DATA_DIR / "database"
 
-SCREENER_CSV_PATH = (
-    _resolve_project_path(
-        "SCREENER_CSV_PATH",
-        "stocks_screen.csv",
-    )
+SCREENER_CSV_PATH = _resolve_project_path(
+    "SCREENER_CSV_PATH",
+    "stocks_screen.csv",
 )
 
 VALIDATED_CSV_PATH = (
@@ -322,6 +304,16 @@ NEWS_MAX_MATCHED_EVENTS = _get_int(
     10,
 )
 
+NEWS_CACHE_ENABLED = _get_bool(
+    "NEWS_CACHE_ENABLED",
+    True,
+)
+
+NEWS_CACHE_REFRESH_MINUTES = _get_int(
+    "NEWS_CACHE_REFRESH_MINUTES",
+    15,
+)
+
 
 # ---------------------------------------------------------------------------
 # Historical NSE corporate-action confirmation
@@ -356,6 +348,16 @@ NSE_HISTORICAL_CA_PADDING_DAYS = _get_int(
     7,
 )
 
+NSE_HISTORICAL_CA_CACHE_ENABLED = _get_bool(
+    "NSE_HISTORICAL_CA_CACHE_ENABLED",
+    True,
+)
+
+NSE_HISTORICAL_CA_CACHE_REFRESH_DAYS = _get_int(
+    "NSE_HISTORICAL_CA_CACHE_REFRESH_DAYS",
+    30,
+)
+
 
 # ---------------------------------------------------------------------------
 # Ensure local directories exist
@@ -376,103 +378,35 @@ for directory in (
 
 
 if __name__ == "__main__":
+    print("Project root:", PROJECT_ROOT)
+    print("Screener CSV:", SCREENER_CSV_PATH)
+    print("Validated CSV:", VALIDATED_CSV_PATH)
+    print("SQLite DB:", SQLITE_DB_PATH)
+    print("Groww API key configured:", bool(GROWW_API_KEY))
+    print("Groww API secret configured:", bool(GROWW_API_SECRET))
+    print("Groww direct access token configured:", bool(GROWW_ACCESS_TOKEN))
+    print("Exchange:", GROWW_EXCHANGE)
+    print("Segment:", GROWW_SEGMENT)
+    print("Hourly history days:", DEFAULT_HOURLY_HISTORY_DAYS)
+    print("15m setup history days:", DEFAULT_SETUP_15M_DAYS)
+    print("Max symbols:", DEFAULT_MAX_SYMBOLS)
+    print("1H request chunk days:", GROWW_HOURLY_REQUEST_CHUNK_DAYS)
+    print("15m request chunk days:", GROWW_15M_REQUEST_CHUNK_DAYS)
+    print("Gap-repair chunk days:", GROWW_GAP_REPAIR_CHUNK_DAYS)
+    print("Recent continuity days:", MARKET_DATA_RECENT_CONTINUITY_DAYS)
+    print("75m minimum source bars:", MARKET_DATA_SETUP_MIN_SOURCE_BARS)
+    print("75m minimum usable bars:", MARKET_DATA_MIN_SETUP_BARS)
+    print("NSE announcements RSS:", NSE_ANNOUNCEMENTS_RSS_URL)
+    print("NSE corporate actions RSS:", NSE_CORPORATE_ACTIONS_RSS_URL)
+    print("News event lookback days:", NEWS_EVENT_LOOKBACK_DAYS)
+    print("News source max stale days:", NEWS_SOURCE_MAX_STALE_DAYS)
+    print("News cache enabled:", NEWS_CACHE_ENABLED)
+    print("News cache refresh minutes:", NEWS_CACHE_REFRESH_MINUTES)
+    print("Historical CA web endpoint:", NSE_CORPORATE_ACTIONS_API_URL)
+    print("Historical CA timeout seconds:", NSE_HISTORICAL_CA_TIMEOUT_SECONDS)
+    print("Historical CA padding days:", NSE_HISTORICAL_CA_PADDING_DAYS)
+    print("Historical CA cache enabled:", NSE_HISTORICAL_CA_CACHE_ENABLED)
     print(
-        "Project root:",
-        PROJECT_ROOT,
-    )
-    print(
-        "Screener CSV:",
-        SCREENER_CSV_PATH,
-    )
-    print(
-        "Validated CSV:",
-        VALIDATED_CSV_PATH,
-    )
-    print(
-        "SQLite DB:",
-        SQLITE_DB_PATH,
-    )
-    print(
-        "Groww API key configured:",
-        bool(GROWW_API_KEY),
-    )
-    print(
-        "Groww API secret configured:",
-        bool(GROWW_API_SECRET),
-    )
-    print(
-        "Groww direct access token configured:",
-        bool(GROWW_ACCESS_TOKEN),
-    )
-    print(
-        "Exchange:",
-        GROWW_EXCHANGE,
-    )
-    print(
-        "Segment:",
-        GROWW_SEGMENT,
-    )
-    print(
-        "Hourly history days:",
-        DEFAULT_HOURLY_HISTORY_DAYS,
-    )
-    print(
-        "15m setup history days:",
-        DEFAULT_SETUP_15M_DAYS,
-    )
-    print(
-        "Max symbols:",
-        DEFAULT_MAX_SYMBOLS,
-    )
-    print(
-        "1H request chunk days:",
-        GROWW_HOURLY_REQUEST_CHUNK_DAYS,
-    )
-    print(
-        "15m request chunk days:",
-        GROWW_15M_REQUEST_CHUNK_DAYS,
-    )
-    print(
-        "Gap-repair chunk days:",
-        GROWW_GAP_REPAIR_CHUNK_DAYS,
-    )
-    print(
-        "Recent continuity days:",
-        MARKET_DATA_RECENT_CONTINUITY_DAYS,
-    )
-    print(
-        "75m minimum source bars:",
-        MARKET_DATA_SETUP_MIN_SOURCE_BARS,
-    )
-    print(
-        "75m minimum usable bars:",
-        MARKET_DATA_MIN_SETUP_BARS,
-    )
-    print(
-        "NSE announcements RSS:",
-        NSE_ANNOUNCEMENTS_RSS_URL,
-    )
-    print(
-        "NSE corporate actions RSS:",
-        NSE_CORPORATE_ACTIONS_RSS_URL,
-    )
-    print(
-        "News event lookback days:",
-        NEWS_EVENT_LOOKBACK_DAYS,
-    )
-    print(
-        "News source max stale days:",
-        NEWS_SOURCE_MAX_STALE_DAYS,
-    )
-    print(
-        "Historical CA web endpoint:",
-        NSE_CORPORATE_ACTIONS_API_URL,
-    )
-    print(
-        "Historical CA timeout seconds:",
-        NSE_HISTORICAL_CA_TIMEOUT_SECONDS,
-    )
-    print(
-        "Historical CA padding days:",
-        NSE_HISTORICAL_CA_PADDING_DAYS,
+        "Historical CA cache refresh days:",
+        NSE_HISTORICAL_CA_CACHE_REFRESH_DAYS,
     )

@@ -247,15 +247,31 @@ def main() -> None:
     )
     from news.news_engine import (
         event_profile_for_symbol,
-        fetch_nse_announcements,
     )
-    from news.nse_historical_corporate_actions import (
+    from news.persistent_sources import (
         fetch_historical_actions_for_discontinuities,
+        fetch_nse_announcements,
     )
 
     groww = get_groww_api()
     news_bundle = (
         fetch_nse_announcements()
+    )
+
+    news_cache = (
+        news_bundle.get(
+            "cache",
+            {},
+        )
+    )
+
+    print(
+        "NSE event cache: "
+        f"enabled={news_cache.get('enabled')} | "
+        f"hit={news_cache.get('hit')} | "
+        f"refreshed={news_cache.get('refreshed')} | "
+        f"stale_fallback={news_cache.get('stale_fallback')} | "
+        f"age_seconds={news_cache.get('age_seconds')}"
     )
 
     print(
@@ -429,6 +445,22 @@ def main() -> None:
                     f"available={historical_ca.get('available')} | "
                     f"complete={historical_ca.get('complete')} | "
                     f"actions={len(historical_ca.get('actions', []))}"
+                )
+
+                historical_cache = (
+                    historical_ca.get(
+                        "cache",
+                        {},
+                    )
+                )
+
+                print(
+                    f"{symbol}: historical CA cache "
+                    f"enabled={historical_cache.get('enabled')} | "
+                    f"hit={historical_cache.get('hit')} | "
+                    f"refreshed={historical_cache.get('refreshed')} | "
+                    f"complete_reused="
+                    f"{historical_cache.get('complete_result_reused')}"
                 )
 
             corporate_action_reconciliation = (
