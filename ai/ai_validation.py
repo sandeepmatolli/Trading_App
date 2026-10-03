@@ -13,7 +13,50 @@ FINANCIAL_KEYWORDS = {
     "nbfc",
     "insurance",
     "housing finance",
+    "wealth management",
+    "asset management",
+    "investment management",
+    "portfolio management",
+    "investment services",
+    "investment banking",
+    "merchant banking",
+    "stock broking",
+    "stockbroking",
+    "broking",
+    "brokerage",
+    "securities",
+    "capital markets",
+    "capital market",
+    "mutual fund",
+    "microfinance",
+    "micro finance",
 }
+
+# Explicit, externally verified cases for CSV snapshots that use opaque or
+# non-descriptive industry categories. These are exact symbols, not fuzzy
+# company-name matches. The list is intentionally conservative and auditable.
+FINANCIAL_SYMBOL_OVERRIDES = frozenset({"360ONE", "5PAISA"})
+
+
+def financial_classification_reason(fund_profile: Dict, symbol: str = "") -> Optional[str]:
+    """Return the matching V1 deferral reason, or None for no known match.
+
+    Check only structured Screener industry/industry-group/sector metadata and
+    an explicit exact-symbol override. Never infer an entire sector from the
+    substring 'capital' in a company name or from the user's cap bucket.
+    """
+    normalized_symbol = str(symbol or fund_profile.get("symbol") or "").strip().upper()
+    if normalized_symbol in FINANCIAL_SYMBOL_OVERRIDES:
+        return "VERIFIED_FINANCIAL_SYMBOL:" + normalized_symbol
+
+    text = " ".join(
+        str(fund_profile.get(key, "") or "")
+        for key in ("industry", "industry_group", "sector")
+    ).casefold()
+    for keyword in sorted(FINANCIAL_KEYWORDS, key=lambda item: (-len(item), item)):
+        if keyword in text:
+            return "FINANCIAL_INDUSTRY:" + keyword.upper().replace(" ", "_")
+    return None
 
 
 def _number(value) -> Optional[float]:
@@ -28,17 +71,9 @@ def _number(value) -> Optional[float]:
 
 def _is_financial_company(
     fund_profile: Dict,
+    symbol: str = "",
 ) -> bool:
-    text = " ".join(
-        str(fund_profile.get(key, "") or "")
-        for key in (
-            "industry",
-            "industry_group",
-            "sector",
-        )
-    ).lower()
-
-    return any(keyword in text for keyword in FINANCIAL_KEYWORDS)
+    return financial_classification_reason(fund_profile, symbol=symbol) is not None
 
 
 def _historical_warnings(
@@ -176,7 +211,7 @@ def evaluate_candidate(
                 "Market data is usable for research but not candidate-grade."
             )
 
-    is_financial = _is_financial_company(fund_profile)
+    is_financial = _is_financial_company(fund_profile, symbol=symbol)
 
     roce = _number(fund_profile.get("roce"))
     debt_to_equity = _number(fund_profile.get("de_ratio"))

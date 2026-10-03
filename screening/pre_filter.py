@@ -12,7 +12,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from ai.ai_validation import FINANCIAL_KEYWORDS
+from ai.ai_validation import financial_classification_reason
 
 STATUS_PASS = "ELIGIBLE_FOR_DEEP_SCAN"
 STATUS_REVIEW = "REVIEW_REQUIRED"
@@ -74,11 +74,15 @@ def evaluate_pre_filter(row: pd.Series, event_profile: Dict) -> Dict:
     """Mirror only cheap, explicit final-gate rules. Never infer SMC trend."""
     symbol = _text(row.get("NSE Code")).upper()
     company = _text(row.get("Name"))
-    industry_text = " ".join(
-        _text(row.get(key))
-        for key in ("Industry", "Industry Group", "Sector")
-    ).lower()
-    financial = any(keyword in industry_text for keyword in FINANCIAL_KEYWORDS)
+    financial_reason = financial_classification_reason(
+        {
+            "industry": _text(row.get("Industry")),
+            "industry_group": _text(row.get("Industry Group")),
+            "sector": _text(row.get("Sector")),
+        },
+        symbol=symbol,
+    )
+    financial = financial_reason is not None
     de = _number(row.get("Debt to equity"))
     roce = _number(row.get("Return on capital employed"))
     market_cap = _number(row.get("Market Capitalization"))
@@ -124,6 +128,7 @@ def evaluate_pre_filter(row: pd.Series, event_profile: Dict) -> Dict:
     elif financial:
         status = STATUS_DEFER
         informational.append("DEDICATED_FINANCIAL_MODEL_NOT_IMPLEMENTED")
+        informational.append(financial_reason)
     elif review_reasons:
         status = STATUS_REVIEW
     else:
@@ -133,6 +138,8 @@ def evaluate_pre_filter(row: pd.Series, event_profile: Dict) -> Dict:
         "symbol": symbol,
         "company": company,
         "status": status,
+        "financial_sector_model_deferred": financial,
+        "financial_sector_reason": financial_reason,
         "scan_eligible": status in (STATUS_PASS, STATUS_REVIEW),
         "market_cap_cr": market_cap,
         "cap_bucket": cap_bucket(market_cap),
