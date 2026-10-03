@@ -315,19 +315,18 @@ class EventCache:
                     or []
                 )
 
+                # Error/warning text must remain source-specific. Bundle-level
+                # health text can describe a different feed and must never be
+                # copied into unrelated source rows.
                 last_error = (
                     str(source_errors[-1])
                     if source_errors
-                    else source_health.get(
-                        "last_error"
-                    )
+                    else None
                 )
                 last_warning = (
                     str(source_warnings[-1])
                     if source_warnings
-                    else source_health.get(
-                        "last_warning"
-                    )
+                    else None
                 )
 
                 last_attempt_at = (
