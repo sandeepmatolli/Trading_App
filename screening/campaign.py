@@ -15,7 +15,7 @@ from typing import Dict, Optional
 from uuid import uuid4
 
 from screening.batch_runner import (
-    IST, ScanSafetyError, _hash_file, ist_now, load_inputs,
+    IST, ScanSafetyError, _hash_file, _is_pipeline_failure, ist_now, load_inputs,
 )
 
 LEDGER_SCHEMA = 1
@@ -108,8 +108,15 @@ def record_session(ledger_path: Path, state_path: Path) -> Dict:
         for row in rows:
             if not isinstance(row, dict) or row.get("symbol") not in batch["symbols"] or row.get("decision") not in VALID_DECISIONS:
                 raise ScanSafetyError(f"Invalid archived child result: {path}")
+            # main.py can catch an exception and serialize it as DATA_REJECT with
+            # a Pipeline error: risk flag while returning process exit code 0.
+            # batch_runner correctly leaves such a symbol pending for retry.
+            # Preserve that immutable attempt JSON, but do NOT mistake it for a
+            # completed research decision or a conflict with a later good retry.
+            if _is_pipeline_failure(row):
+                continue
             if row["symbol"] in archived and archived[row["symbol"]]["row"] != row:
-                raise ScanSafetyError("Conflicting archived rows for one symbol")
+                raise ScanSafetyError("Conflicting archived completed rows for one symbol")
             archived[row["symbol"]] = {"row": row, "batch_started_at": batch.get("started_at"), "batch_number": name}
     additions = 0
     for symbol, row in completed.items():
