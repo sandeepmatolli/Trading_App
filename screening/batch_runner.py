@@ -1,0 +1,314 @@
+"""Bounded, restartable wrapper for the existing manual research main.py.
+
+Does not implement API-level throttling: main.py itself requests multiple Groww
+chunks per symbol. This wrapper caps symbols per child process, intervals between
+child launches, and total launches per invocation. No orders are placed here.
+"""
+from __future__ import annotations
+
+from collections import Counter
+from datetime import datetime
+from hashlib import sha256
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import time
+from typing import Callable, Dict, List, Optional
+from uuid import uuid4
+from zoneinfo import ZoneInfo
+
+
+IST = ZoneInfo("Asia/Kolkata")
+SCHEMA_VERSION = 1
+VALID_DECISIONS = {"DATA_REJECT", "REJECT", "WATCH", "CANDIDATE"}
+VALID_PREFILTER = {"ELIGIBLE_FOR_DEEP_SCAN", "REVIEW_REQUIRED"}
+SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9&._-]{0,29}$")
+# A changed strategy/source engine must not silently mix output with old state.
+CODE_FILES = (
+    "batch_scan.py", "screening/batch_runner.py", "screening/pre_filter.py",
+    "ai/ai_validation.py", "main.py", "config.py", "news/news_engine.py",
+    "news/persistent_sources.py", "market_data/groww_fetch.py",
+    "technical/smc_engine.py",
+)
+
+
+class ScanSafetyError(RuntimeError):
+    """No batch may start unless the input and checkpoint invariants hold."""
+
+
+def ist_now() -> datetime:
+    return datetime.now(tz=IST)
+
+
+def _hash_file(path: Path) -> str:
+    if not path.is_file():
+        raise ScanSafetyError(f"Required file is missing: {path}")
+    digest = sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_json_atomic(path: Path, value: Dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + "." + uuid4().hex + ".tmp")
+    try:
+        with temp.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(value, handle, indent=2, ensure_ascii=False, default=str)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _read_json(path: Path) -> Dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ScanSafetyError(f"Cannot read valid JSON from {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ScanSafetyError(f"Expected JSON object: {path}")
+    return value
+
+
+def _check_today(path: Path, today: str) -> None:
+    if datetime.fromtimestamp(path.stat().st_mtime, IST).date().isoformat() != today:
+        raise ScanSafetyError(
+            f"Input was not generated today in IST: {path}. "
+            "Regenerate the pre-filter report/queue from current CSV/events."
+        )
+
+
+def load_inputs(project_root: Path, queue: Path, report: Path, csv: Path,
+                *, now: Optional[datetime] = None) -> Dict:
+    """Validate the pre-filter queue rather than trusting a free-form symbols file."""
+    now = now or ist_now()
+    today = now.astimezone(IST).date().isoformat()
+    for path in (queue, report, csv):
+        if not path.is_file():
+            raise ScanSafetyError(f"Missing input: {path}")
+    _check_today(queue, today)
+    _check_today(report, today)
+    payload = _read_json(report)
+    if payload.get("stage") != "fundamental_event_prefilter":
+        raise ScanSafetyError("Report is not a fundamental/event pre-filter report.")
+    if payload.get("source_event_candidate_eligible") is not True:
+        raise ScanSafetyError("Required official event evidence is not candidate-grade.")
+    if (payload.get("event_cache") or {}).get("stale_fallback"):
+        raise ScanSafetyError("Stale NSE event fallback cannot seed a new scan.")
+    queue_symbols = [line.strip().upper() for line in queue.read_text(encoding="utf-8").splitlines()
+                     if line.strip()]
+    report_symbols = payload.get("selected_symbols")
+    if not isinstance(report_symbols, list) or queue_symbols != report_symbols:
+        raise ScanSafetyError("Queue differs from the report's selected_symbols.")
+    if not queue_symbols or len(queue_symbols) != len(set(queue_symbols)):
+        raise ScanSafetyError("Queue is empty or contains repeated symbols.")
+    if any(not SYMBOL_PATTERN.fullmatch(s) for s in queue_symbols):
+        raise ScanSafetyError("Queue contains an invalid NSE symbol.")
+    eligible = {row.get("symbol") for row in payload.get("rows", [])
+                if isinstance(row, dict) and row.get("status") in VALID_PREFILTER}
+    if any(s not in eligible for s in queue_symbols):
+        raise ScanSafetyError("Queue includes a rejected/deferred/unknown symbol.")
+    code_hashes = {name: _hash_file(project_root / name) for name in CODE_FILES}
+    hashes = {
+        "queue": _hash_file(queue), "report": _hash_file(report),
+        "csv": _hash_file(csv), "code": code_hashes,
+    }
+    return {"date_ist": today, "symbols": queue_symbols, "hashes": hashes,
+            "csv_path": str(csv.resolve()), "queue_path": str(queue.resolve()),
+            "report_path": str(report.resolve())}
+
+
+def create_or_resume_state(state_path: Path, session_root: Path, inputs: Dict,
+                           *, new_run: bool = False, now: Optional[datetime] = None) -> Dict:
+    now = now or ist_now()
+    if state_path.exists() and not new_run:
+        state = _read_json(state_path)
+        if state.get("schema_version") != SCHEMA_VERSION:
+            raise ScanSafetyError("Unsupported checkpoint schema. Create an explicit new run.")
+        for field in ("date_ist", "symbols", "hashes", "csv_path", "queue_path", "report_path"):
+            if state.get(field) != inputs.get(field):
+                raise ScanSafetyError(
+                    f"Checkpoint input changed ({field}); resume rejected. "
+                    "Use a current pre-filter and --new-run to start a separate session."
+                )
+        return state
+    session_id = now.strftime("%Y%m%dT%H%M%S") + "_" + uuid4().hex[:8]
+    state = {"schema_version": SCHEMA_VERSION, **inputs, "session_id": session_id,
+             "session_dir": str((session_root / session_id).resolve()),
+             "created_at": now.isoformat(), "completed": {}, "attempts": {},
+             "failures": {}, "attempt_sequence": 0, "batches": [],
+             "last_batch_started_at": None}
+    Path(state["session_dir"]).mkdir(parents=True, exist_ok=False)
+    _write_json_atomic(state_path, state)
+    return state
+
+
+def _is_pipeline_failure(row: Dict) -> bool:
+    """A quality DATA_REJECT is final; a caught main.py exception is not."""
+    if row.get("decision") != "DATA_REJECT":
+        return False
+    return any(str(x).startswith("Pipeline error:") for x in row.get("risk_flags", []) or [])
+
+
+def validate_child_results(path: Path, symbols: List[str]) -> List[Dict]:
+    try:
+        results = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ScanSafetyError(f"Main output missing/malformed: {exc}") from exc
+    if not isinstance(results, list) or len(results) != len(symbols):
+        raise ScanSafetyError("Main output did not contain exactly the requested number of rows.")
+    found = []
+    for row in results:
+        if not isinstance(row, dict) or row.get("decision") not in VALID_DECISIONS:
+            raise ScanSafetyError("Main output has an unknown decision or non-object row.")
+        symbol = row.get("symbol")
+        if not isinstance(symbol, str) or symbol not in symbols or symbol in found:
+            raise ScanSafetyError("Main output contains unexpected or duplicated symbol.")
+        found.append(symbol)
+    if set(found) != set(symbols):
+        raise ScanSafetyError("Main output is missing requested symbols.")
+    return results
+
+
+def default_execute(command: List[str], log_path: Path, timeout_seconds: float) -> int:
+    with log_path.open("w", encoding="utf-8", errors="replace") as log:
+        try:
+            completed = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
+                                       check=False, timeout=timeout_seconds)
+            return completed.returncode
+        except subprocess.TimeoutExpired:
+            log.write("\nBATCH TIMEOUT: subprocess killed by runner.\n")
+            return 124
+        except OSError as exc:
+            log.write(f"\nBATCH LAUNCH ERROR: {exc}\n")
+            return 125
+
+
+def _save_merged(state: Dict) -> Path:
+    root = Path(state["session_dir"])
+    rows = [state["completed"][s] for s in state["symbols"] if s in state["completed"]]
+    counts = Counter(r["decision"] for r in rows)
+    pending = [s for s in state["symbols"] if s not in state["completed"]]
+    path = root / "merged_report.json"
+    _write_json_atomic(path, {
+        "schema_version": SCHEMA_VERSION, "session_id": state["session_id"],
+        "date_ist": state["date_ist"], "queue_count": len(state["symbols"]),
+        "completed_count": len(rows), "pending_symbols": pending,
+        "unresolved_failures": {s: state["failures"][s] for s in pending if s in state["failures"]},
+        "decision_counts": dict(counts), "results": rows,
+        "note": "Research output only; batches can use different live-event snapshots. Not point-in-time backtest.",
+    })
+    return path
+
+
+def run_session(project_root: Path, state_path: Path, session_root: Path,
+                inputs: Dict, *, batch_size: int = 1, max_batches: int = 1,
+                cooldown_seconds: float = 30.0, timeout_seconds: float = 900.0,
+                max_attempts: int = 3, new_run: bool = False,
+                execute: Callable = default_execute,
+                sleep: Callable = time.sleep,
+                now_fn: Callable = ist_now) -> Dict:
+    if batch_size < 1 or batch_size > 4 or max_batches < 1:
+        raise ScanSafetyError("batch_size must be 1..4 and max_batches >= 1.")
+    if cooldown_seconds < 0 or timeout_seconds <= 0 or max_attempts < 1:
+        raise ScanSafetyError("Invalid cooldown, timeout, or max-attempts limit.")
+    project_root, state_path, session_root = (Path(project_root), Path(state_path), Path(session_root))
+    lock_path = session_root / ".runner.lock"
+    session_root.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as exc:
+        raise ScanSafetyError(
+            f"Scanner lock exists: {lock_path}. Confirm no scanner is running before manual removal."
+        ) from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as lock:
+            lock.write(f"pid={os.getpid()} started={now_fn().isoformat()}\n")
+        state = create_or_resume_state(state_path, session_root, inputs,
+                                       new_run=new_run, now=now_fn())
+        root = Path(state["session_dir"])
+        shared_shortlist = project_root / "data" / "output" / "shortlist.json"
+        error = None
+        for _ in range(max_batches):
+            if now_fn().astimezone(IST).date().isoformat() != state["date_ist"]:
+                error = "IST date rolled over. Regenerate the pre-filter and start a new run."
+                break
+            remaining = [s for s in state["symbols"] if s not in state["completed"]]
+            if not remaining:
+                break
+            exhausted = [s for s in remaining if state["attempts"].get(s, 0) >= max_attempts]
+            if exhausted:
+                error = f"Max attempts reached; manual review required: {exhausted}"
+                break
+            batch_symbols = remaining[:batch_size]
+            previous = state.get("last_batch_started_at")
+            if previous:
+                last = datetime.fromisoformat(previous)
+                delay = cooldown_seconds - (now_fn() - last).total_seconds()
+                if delay > 0:
+                    sleep(delay)
+                if now_fn().astimezone(IST).date().isoformat() != state["date_ist"]:
+                    error = "IST date rolled over during cooldown. Regenerate the pre-filter."
+                    break
+            state["attempt_sequence"] += 1
+            num = state["attempt_sequence"]
+            attempt_dir = root / f"batch_{num:04d}"
+            attempt_dir.mkdir(parents=True, exist_ok=False)
+            state["last_batch_started_at"] = now_fn().isoformat()
+            for symbol in batch_symbols:
+                state["attempts"][symbol] = state["attempts"].get(symbol, 0) + 1
+            _write_json_atomic(state_path, state)  # mark in-flight BEFORE launching
+            if shared_shortlist.is_file():
+                if num == 1 and not (root / "original_shortlist_before_session.json").exists():
+                    shutil.copy2(shared_shortlist, root / "original_shortlist_before_session.json")
+                shared_shortlist.unlink()
+            cmd = [sys.executable, str(project_root / "main.py"),
+                   "--csv", state["csv_path"], "--symbols", ",".join(batch_symbols)]
+            log_path = attempt_dir / "main.log"
+            code = execute(cmd, log_path, timeout_seconds)
+            batch_meta = {"number": num, "symbols": batch_symbols,
+                          "started_at": state["last_batch_started_at"],
+                          "returncode": code, "log": str(log_path)}
+            if code != 0:
+                error = f"main.py exited {code}; inspect {log_path}"
+                for s in batch_symbols:
+                    state["failures"][s] = error
+            else:
+                try:
+                    rows = validate_child_results(shared_shortlist, batch_symbols)
+                    # Save an immutable copy before considering any row complete.
+                    shutil.copy2(shared_shortlist, attempt_dir / "results.json")
+                    for row in rows:
+                        s = row["symbol"]
+                        if _is_pipeline_failure(row):
+                            state["failures"][s] = "Main caught a pipeline exception; see batch log."
+                            error = f"Pipeline error for {s}; inspect {log_path}"
+                        else:
+                            state["completed"][s] = row
+                            state["failures"].pop(s, None)
+                except (ScanSafetyError, OSError) as exc:
+                    error = f"Unsafe child results: {exc}; inspect {log_path}"
+                    for s in batch_symbols:
+                        state["failures"][s] = error
+            batch_meta["error"] = error
+            state["batches"].append(batch_meta)
+            _write_json_atomic(state_path, state)
+            _save_merged(state)
+            if error:
+                break
+        merged = _save_merged(state)
+        pending_count = sum(s not in state["completed"] for s in state["symbols"])
+        return {"ok": error is None, "error": error, "completed": len(state["completed"]),
+                "total": len(state["symbols"]), "pending": pending_count,
+                "session_id": state["session_id"], "merged_path": str(merged),
+                "state_path": str(state_path), "batches_this_session": len(state["batches"])}
+    finally:
+        lock_path.unlink(missing_ok=True)
