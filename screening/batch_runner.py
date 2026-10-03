@@ -1,8 +1,7 @@
-"""Bounded, restartable wrapper for the existing manual research main.py.
+"""Historical, multi-day research progress ledger over separate daily scanner sessions.
 
-Does not implement API-level throttling: main.py itself requests multiple Groww
-chunks per symbol. This wrapper caps symbols per child process, intervals between
-child launches, and total launches per invocation. No orders are placed here.
+Never refreshes or promotes a past research decision. Only current-day pre-filter
+output can seed the *next* batch session. No Groww requests or order operations.
 """
 from __future__ import annotations
 
@@ -12,354 +11,233 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
-import re
-import shutil
-import subprocess
-import sys
-import time
-from typing import Callable, Dict, List, Optional
+from typing import Dict, Optional
 from uuid import uuid4
-from zoneinfo import ZoneInfo
 
-
-IST = ZoneInfo("Asia/Kolkata")
-SCHEMA_VERSION = 1
-VALID_DECISIONS = {"DATA_REJECT", "REJECT", "WATCH", "CANDIDATE"}
-VALID_PREFILTER = {"ELIGIBLE_FOR_DEEP_SCAN", "REVIEW_REQUIRED"}
-SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9&._-]{0,29}$")
-# A changed strategy/source engine must not silently mix output with old state.
-CODE_FILES = (
-    # Complete first-party research code, including helpers transitively used
-    # by main.py. Exclude local secrets and generated data; code edits may not
-    # silently mix previously checkpointed results with a different engine.
-    "batch_scan.py",
-    "prefilter_scan.py",
-    "requirements.txt",
-    "config.py",
-    "main.py",
-    "ai/ai_validation.py",
-    "fundamentals/csv_validator.py",
-    "fundamentals/master_builder.py",
-    "fundamentals/screener_symbols.py",
-    "screening/__init__.py",
-    "screening/batch_runner.py",
-    "screening/pre_filter.py",
-    "market_data/corporate_action_adjustment.py",
-    "market_data/groww_auth.py",
-    "market_data/groww_fetch.py",
-    "news/cache_db.py",
-    "news/corporate_action_cache.py",
-    "news/corporate_action_reconciliation.py",
-    "news/event_cache.py",
-    "news/news_engine.py",
-    "news/nse_historical_corporate_actions.py",
-    "news/persistent_sources.py",
-    "news/retry_utils.py",
-    "technical/smc_engine.py",
+from screening.batch_runner import (
+    IST, ScanSafetyError, _hash_file, _is_pipeline_failure, ist_now, load_inputs,
 )
 
-
-class ScanSafetyError(RuntimeError):
-    """No batch may start unless the input and checkpoint invariants hold."""
-
-
-def ist_now() -> datetime:
-    return datetime.now(tz=IST)
+LEDGER_SCHEMA = 1
+VALID_DECISIONS = {"DATA_REJECT", "REJECT", "WATCH", "CANDIDATE"}
 
 
-def _hash_file(path: Path) -> str:
-    if not path.is_file():
-        raise ScanSafetyError(f"Required file is missing: {path}")
-    digest = sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _write_json_atomic(path: Path, value: Dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + "." + uuid4().hex + ".tmp")
+def _read(path: Path) -> Dict:
     try:
-        with temp.open("w", encoding="utf-8", newline="\n") as handle:
-            json.dump(value, handle, indent=2, ensure_ascii=False, default=str)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, path)
-    finally:
-        temp.unlink(missing_ok=True)
-
-
-def _read_json(path: Path) -> Dict:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ScanSafetyError(f"Cannot read valid JSON from {path}: {exc}") from exc
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        raise ScanSafetyError(f"Unable to read {path}: {exc}") from exc
     if not isinstance(value, dict):
-        raise ScanSafetyError(f"Expected JSON object: {path}")
+        raise ScanSafetyError(f"Expected an object at {path}")
     return value
 
 
-def _check_today(path: Path, today: str) -> None:
-    if datetime.fromtimestamp(path.stat().st_mtime, IST).date().isoformat() != today:
-        raise ScanSafetyError(
-            f"Input was not generated today in IST: {path}. "
-            "Regenerate the pre-filter report/queue from current CSV/events."
-        )
+def _digest(obj) -> str:
+    return sha256(json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
 
 
-def load_inputs(project_root: Path, queue: Path, report: Path, csv: Path,
-                *, now: Optional[datetime] = None) -> Dict:
-    """Validate the pre-filter queue rather than trusting a free-form symbols file."""
-    now = now or ist_now()
-    today = now.astimezone(IST).date().isoformat()
-    for path in (queue, report, csv):
-        if not path.is_file():
-            raise ScanSafetyError(f"Missing input: {path}")
-    _check_today(queue, today)
-    _check_today(report, today)
-    payload = _read_json(report)
-    if payload.get("stage") != "fundamental_event_prefilter":
-        raise ScanSafetyError("Report is not a fundamental/event pre-filter report.")
-    if payload.get("source_event_candidate_eligible") is not True:
-        raise ScanSafetyError("Required official event evidence is not candidate-grade.")
-    if (payload.get("event_cache") or {}).get("stale_fallback"):
-        raise ScanSafetyError("Stale NSE event fallback cannot seed a new scan.")
-    queue_symbols = [line.strip().upper() for line in queue.read_text(encoding="utf-8").splitlines()
-                     if line.strip()]
-    report_symbols = payload.get("selected_symbols")
-    if not isinstance(report_symbols, list) or queue_symbols != report_symbols:
-        raise ScanSafetyError("Queue differs from the report's selected_symbols.")
-    if not queue_symbols or len(queue_symbols) != len(set(queue_symbols)):
-        raise ScanSafetyError("Queue is empty or contains repeated symbols.")
-    if any(not SYMBOL_PATTERN.fullmatch(s) for s in queue_symbols):
-        raise ScanSafetyError("Queue contains an invalid NSE symbol.")
-    eligible = {row.get("symbol") for row in payload.get("rows", [])
-                if isinstance(row, dict) and row.get("status") in VALID_PREFILTER}
-    if any(s not in eligible for s in queue_symbols):
-        raise ScanSafetyError("Queue includes a rejected/deferred/unknown symbol.")
-    code_hashes = {name: _hash_file(project_root / name) for name in CODE_FILES}
-    hashes = {
-        "queue": _hash_file(queue), "report": _hash_file(report),
-        "csv": _hash_file(csv), "code": code_hashes,
-    }
-    return {"date_ist": today, "symbols": queue_symbols, "hashes": hashes,
-            "csv_path": str(csv.resolve()), "queue_path": str(queue.resolve()),
-            "report_path": str(report.resolve())}
-
-
-def verify_input_integrity(project_root: Path, inputs: Dict) -> None:
-    """Recheck the original snapshot before each child launch.
-
-    load_inputs() checks hashes at startup and a resume checks checkpoint
-    metadata. A single invocation can launch multiple batches, so check again
-    after every cooldown to avoid silently mixing different code, CSV or
-    pre-filter contents if an operator edits a file while the scan is running.
-    """
-    hashes = inputs["hashes"]
-    for key, path_key in (
-        ("queue", "queue_path"),
-        ("report", "report_path"),
-        ("csv", "csv_path"),
-    ):
-        if _hash_file(Path(inputs[path_key])) != hashes[key]:
-            raise ScanSafetyError(f"Snapshot changed during active scan: {key}")
-    if set(hashes["code"]) != set(CODE_FILES):
-        raise ScanSafetyError("Code fingerprint coverage differs from this runner")
-    for name in CODE_FILES:
-        if _hash_file(Path(project_root) / name) != hashes["code"][name]:
-            raise ScanSafetyError(f"Code changed during active scan: {name}")
-
-
-def create_or_resume_state(state_path: Path, session_root: Path, inputs: Dict,
-                           *, new_run: bool = False, now: Optional[datetime] = None) -> Dict:
-    now = now or ist_now()
-    if state_path.exists() and not new_run:
-        state = _read_json(state_path)
-        if state.get("schema_version") != SCHEMA_VERSION:
-            raise ScanSafetyError("Unsupported checkpoint schema. Create an explicit new run.")
-        for field in ("date_ist", "symbols", "hashes", "csv_path", "queue_path", "report_path"):
-            if state.get(field) != inputs.get(field):
-                raise ScanSafetyError(
-                    f"Checkpoint input changed ({field}); resume rejected. "
-                    "Use a current pre-filter and --new-run to start a separate session."
-                )
-        return state
-    session_id = now.strftime("%Y%m%dT%H%M%S") + "_" + uuid4().hex[:8]
-    state = {"schema_version": SCHEMA_VERSION, **inputs, "session_id": session_id,
-             "session_dir": str((session_root / session_id).resolve()),
-             "created_at": now.isoformat(), "completed": {}, "attempts": {},
-             "failures": {}, "attempt_sequence": 0, "batches": [],
-             "last_batch_started_at": None}
-    Path(state["session_dir"]).mkdir(parents=True, exist_ok=False)
-    _write_json_atomic(state_path, state)
-    return state
-
-
-def _is_pipeline_failure(row: Dict) -> bool:
-    """A quality DATA_REJECT is final; a caught main.py exception is not."""
-    if row.get("decision") != "DATA_REJECT":
-        return False
-    return any(str(x).startswith("Pipeline error:") for x in row.get("risk_flags", []) or [])
-
-
-def validate_child_results(path: Path, symbols: List[str]) -> List[Dict]:
+def _write(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + "." + uuid4().hex + ".tmp")
     try:
-        results = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ScanSafetyError(f"Main output missing/malformed: {exc}") from exc
-    if not isinstance(results, list) or len(results) != len(symbols):
-        raise ScanSafetyError("Main output did not contain exactly the requested number of rows.")
-    found = []
-    for row in results:
-        if not isinstance(row, dict) or row.get("decision") not in VALID_DECISIONS:
-            raise ScanSafetyError("Main output has an unknown decision or non-object row.")
-        symbol = row.get("symbol")
-        if not isinstance(symbol, str) or symbol not in symbols or symbol in found:
-            raise ScanSafetyError("Main output contains unexpected or duplicated symbol.")
-        found.append(symbol)
-    if set(found) != set(symbols):
-        raise ScanSafetyError("Main output is missing requested symbols.")
-    return results
-
-
-def default_execute(command: List[str], log_path: Path, timeout_seconds: float) -> int:
-    with log_path.open("w", encoding="utf-8", errors="replace") as log:
-        try:
-            completed = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
-                                       check=False, timeout=timeout_seconds)
-            return completed.returncode
-        except subprocess.TimeoutExpired:
-            log.write("\nBATCH TIMEOUT: subprocess killed by runner.\n")
-            return 124
-        except OSError as exc:
-            log.write(f"\nBATCH LAUNCH ERROR: {exc}\n")
-            return 125
-
-
-def _save_merged(state: Dict) -> Path:
-    root = Path(state["session_dir"])
-    rows = [state["completed"][s] for s in state["symbols"] if s in state["completed"]]
-    counts = Counter(r["decision"] for r in rows)
-    pending = [s for s in state["symbols"] if s not in state["completed"]]
-    path = root / "merged_report.json"
-    _write_json_atomic(path, {
-        "schema_version": SCHEMA_VERSION, "session_id": state["session_id"],
-        "date_ist": state["date_ist"], "queue_count": len(state["symbols"]),
-        "completed_count": len(rows), "pending_symbols": pending,
-        "unresolved_failures": {s: state["failures"][s] for s in pending if s in state["failures"]},
-        "decision_counts": dict(counts), "results": rows,
-        "note": "Research output only; batches can use different live-event snapshots. Not point-in-time backtest.",
-    })
-    return path
-
-
-def run_session(project_root: Path, state_path: Path, session_root: Path,
-                inputs: Dict, *, batch_size: int = 1, max_batches: int = 1,
-                cooldown_seconds: float = 30.0, timeout_seconds: float = 900.0,
-                max_attempts: int = 3, new_run: bool = False,
-                execute: Callable = default_execute,
-                sleep: Callable = time.sleep,
-                now_fn: Callable = ist_now) -> Dict:
-    if batch_size < 1 or batch_size > 4 or max_batches < 1:
-        raise ScanSafetyError("batch_size must be 1..4 and max_batches >= 1.")
-    if cooldown_seconds < 0 or timeout_seconds <= 0 or max_attempts < 1:
-        raise ScanSafetyError("Invalid cooldown, timeout, or max-attempts limit.")
-    project_root, state_path, session_root = (Path(project_root), Path(state_path), Path(session_root))
-    lock_path = session_root / ".runner.lock"
-    session_root.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError as exc:
-        raise ScanSafetyError(
-            f"Scanner lock exists: {lock_path}. Confirm no scanner is running before manual removal."
-        ) from exc
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as lock:
-            lock.write(f"pid={os.getpid()} started={now_fn().isoformat()}\n")
-        state = create_or_resume_state(state_path, session_root, inputs,
-                                       new_run=new_run, now=now_fn())
-        root = Path(state["session_dir"])
-        shared_shortlist = project_root / "data" / "output" / "shortlist.json"
-        error = None
-        for _ in range(max_batches):
-            if now_fn().astimezone(IST).date().isoformat() != state["date_ist"]:
-                error = "IST date rolled over. Regenerate the pre-filter and start a new run."
-                break
-            remaining = [s for s in state["symbols"] if s not in state["completed"]]
-            if not remaining:
-                break
-            exhausted = [s for s in remaining if state["attempts"].get(s, 0) >= max_attempts]
-            if exhausted:
-                error = f"Max attempts reached; manual review required: {exhausted}"
-                break
-            batch_symbols = remaining[:batch_size]
-            previous = state.get("last_batch_started_at")
-            if previous:
-                last = datetime.fromisoformat(previous)
-                delay = cooldown_seconds - (now_fn() - last).total_seconds()
-                if delay > 0:
-                    sleep(delay)
-                if now_fn().astimezone(IST).date().isoformat() != state["date_ist"]:
-                    error = "IST date rolled over during cooldown. Regenerate the pre-filter."
-                    break
-            try:
-                verify_input_integrity(project_root, inputs)
-            except ScanSafetyError as exc:
-                error = str(exc)
-                break
-            state["attempt_sequence"] += 1
-            num = state["attempt_sequence"]
-            attempt_dir = root / f"batch_{num:04d}"
-            attempt_dir.mkdir(parents=True, exist_ok=False)
-            state["last_batch_started_at"] = now_fn().isoformat()
-            for symbol in batch_symbols:
-                state["attempts"][symbol] = state["attempts"].get(symbol, 0) + 1
-            _write_json_atomic(state_path, state)  # mark in-flight BEFORE launching
-            if shared_shortlist.is_file():
-                if num == 1 and not (root / "original_shortlist_before_session.json").exists():
-                    shutil.copy2(shared_shortlist, root / "original_shortlist_before_session.json")
-                shared_shortlist.unlink()
-            cmd = [sys.executable, str(project_root / "main.py"),
-                   "--csv", state["csv_path"], "--symbols", ",".join(batch_symbols)]
-            log_path = attempt_dir / "main.log"
-            code = execute(cmd, log_path, timeout_seconds)
-            batch_meta = {"number": num, "symbols": batch_symbols,
-                          "started_at": state["last_batch_started_at"],
-                          "returncode": code, "log": str(log_path)}
-            if code != 0:
-                error = f"main.py exited {code}; inspect {log_path}"
-                for s in batch_symbols:
-                    state["failures"][s] = error
-            else:
-                try:
-                    rows = validate_child_results(shared_shortlist, batch_symbols)
-                    # Save an immutable copy before considering any row complete.
-                    shutil.copy2(shared_shortlist, attempt_dir / "results.json")
-                    for row in rows:
-                        s = row["symbol"]
-                        if _is_pipeline_failure(row):
-                            state["failures"][s] = "Main caught a pipeline exception; see batch log."
-                            error = f"Pipeline error for {s}; inspect {log_path}"
-                        else:
-                            state["completed"][s] = row
-                            state["failures"].pop(s, None)
-                except (ScanSafetyError, OSError) as exc:
-                    error = f"Unsafe child results: {exc}; inspect {log_path}"
-                    for s in batch_symbols:
-                        state["failures"][s] = error
-            batch_meta["error"] = error
-            state["batches"].append(batch_meta)
-            _write_json_atomic(state_path, state)
-            _save_merged(state)
-            if error:
-                break
-        merged = _save_merged(state)
-        pending_count = sum(s not in state["completed"] for s in state["symbols"])
-        return {"ok": error is None, "error": error, "completed": len(state["completed"]),
-                "total": len(state["symbols"]), "pending": pending_count,
-                "session_id": state["session_id"], "merged_path": str(merged),
-                "state_path": str(state_path), "batches_this_session": len(state["batches"])}
+        with tmp.open("w", encoding="utf-8", newline="\n") as file:
+            json.dump(obj, file, indent=2, ensure_ascii=False, default=str)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp, path)
     finally:
-        lock_path.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
+
+
+def load_ledger(path: Path) -> Dict:
+    path = Path(path)
+    if not path.exists():
+        return {"schema_version": LEDGER_SCHEMA, "entries": {}, "sessions": {}}
+    ledger = _read(path)
+    if ledger.get("schema_version") != LEDGER_SCHEMA or not isinstance(ledger.get("entries"), dict) or not isinstance(ledger.get("sessions"), dict):
+        raise ScanSafetyError("Campaign ledger has unsupported schema or invalid structure")
+    return ledger
+
+
+def record_session(ledger_path: Path, state_path: Path) -> Dict:
+    """Audit completion against archived child JSON and preserve immutable provenance.
+
+    Must run after the current day's last batch, *before* reusing the shared
+    current_state pointer for a new daily session. Idempotent if unchanged.
+    """
+    ledger_path, state_path = Path(ledger_path), Path(state_path)
+    if (state_path.parent / ".runner.lock").exists():
+        raise ScanSafetyError("The batch runner is active; finish it before recording a campaign session")
+    ledger = load_ledger(ledger_path)
+    state = _read(state_path)
+    sid = state.get("session_id")
+    date = state.get("date_ist")
+    if not isinstance(sid, str) or not sid or not isinstance(date, str):
+        raise ScanSafetyError("Missing session/date in batch checkpoint")
+    if not isinstance(state.get("hashes"), dict) or not isinstance(state.get("completed"), dict) or not isinstance(state.get("batches"), list):
+        raise ScanSafetyError("Invalid batch checkpoint structure")
+    folder = Path(state.get("session_dir", ""))
+    merged = _read(folder / "merged_report.json")
+    if merged.get("session_id") != sid or merged.get("date_ist") != date:
+        raise ScanSafetyError("Session provenance differs from merged report")
+    completed = state["completed"]
+    if merged.get("completed_count") != len(completed) or not isinstance(merged.get("results"), list):
+        raise ScanSafetyError("Merged report count disagrees with checkpoint")
+    expected = [completed[s] for s in state.get("symbols", []) if s in completed]
+    if merged["results"] != expected:
+        raise ScanSafetyError("Merged report content disagrees with checkpoint")
+    fingerprint = _digest({"session_id": sid, "date_ist": date, "symbols": state.get("symbols"), "hashes": state["hashes"], "session_dir": str(folder)})
+    old = ledger["sessions"].get(sid)
+    if old and old.get("session_fingerprint") != fingerprint:
+        raise ScanSafetyError("Existing session ID was reused with different inputs")
+    # Only trust a result that was archived in a successful child batch.
+    archived = {}
+    for batch in state["batches"]:
+        if batch.get("returncode") != 0:
+            continue
+        name = batch.get("number")
+        if not isinstance(name, int) or name < 1:
+            raise ScanSafetyError("Invalid batch number in checkpoint")
+        path = folder / f"batch_{name:04d}" / "results.json"
+        try:
+            rows = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ScanSafetyError(f"Missing/corrupt archived child results: {path}: {exc}") from exc
+        if not isinstance(rows, list) or len(rows) != len(batch.get("symbols", [])):
+            raise ScanSafetyError(f"Unexpected archived child result length: {path}")
+        for row in rows:
+            if not isinstance(row, dict) or row.get("symbol") not in batch["symbols"] or row.get("decision") not in VALID_DECISIONS:
+                raise ScanSafetyError(f"Invalid archived child result: {path}")
+            # main.py can catch an exception and serialize it as DATA_REJECT with
+            # a Pipeline error: risk flag while returning process exit code 0.
+            # batch_runner correctly leaves such a symbol pending for retry.
+            # Preserve that immutable attempt JSON, but do NOT mistake it for a
+            # completed research decision or a conflict with a later good retry.
+            if _is_pipeline_failure(row):
+                continue
+            if row["symbol"] in archived and archived[row["symbol"]]["row"] != row:
+                raise ScanSafetyError("Conflicting archived completed rows for one symbol")
+            archived[row["symbol"]] = {"row": row, "batch_started_at": batch.get("started_at"), "batch_number": name}
+    additions = 0
+    for symbol, row in completed.items():
+        if row.get("symbol") != symbol or row.get("decision") not in VALID_DECISIONS:
+            raise ScanSafetyError(f"Invalid completed result: {symbol}")
+        audit = archived.get(symbol)
+        if not audit or audit["row"] != row or not audit.get("batch_started_at"):
+            raise ScanSafetyError(f"Completed result has no identical archived child evidence: {symbol}")
+        entry = {"symbol": symbol, "decision_at_scan": row["decision"], "row_sha256": _digest(row),
+                 "source_session_id": sid, "source_date_ist": date,
+                 "batch_started_at": audit["batch_started_at"], "batch_number": audit["batch_number"],
+                 "historical_only": True}
+        existing = ledger["entries"].get(symbol)
+        if existing and existing != entry:
+            raise ScanSafetyError(f"Symbol already recorded from another session; manual audit required: {symbol}")
+        if not existing:
+            ledger["entries"][symbol] = entry
+            additions += 1
+    ledger["sessions"][sid] = {"session_fingerprint": fingerprint, "date_ist": date,
+                               "session_dir": str(folder), "hashes": state["hashes"],
+                               "recorded_symbols": sorted(s for s, x in ledger["entries"].items() if x["source_session_id"] == sid)}
+    _write(ledger_path, ledger)
+    return {"session_id": sid, "newly_recorded": additions, "historical_total": len(ledger["entries"]), "ledger_path": str(ledger_path)}
+
+
+
+def verify_previous_campaign_checkpoint(
+    ledger_path: Path, state_path: Path, campaign_root: Path,
+) -> None:
+    """Reject a new campaign plan if a preceding campaign has unrecorded work.
+
+    The shared current_state pointer is replaced by --new-run. Only a saved
+    archive/ledger pair proves completed rows will not be silently forgotten.
+    Standalone exploratory batch sessions (not launched with a campaign plan)
+    do not belong to this campaign and are left alone.
+    """
+    state_path = Path(state_path)
+    scan_root = state_path.parent
+    if (scan_root / ".runner.lock").exists():
+        raise ScanSafetyError("The batch runner is active; do not prepare or replace a campaign session")
+    if not state_path.is_file():
+        return
+    state = _read(state_path)
+    source = Path(state.get("report_path", "")).resolve()
+    daily_root = (Path(campaign_root) / "daily").resolve()
+    if not source.is_relative_to(daily_root):
+        return
+    sid = state.get("session_id")
+    completed = state.get("completed")
+    if not isinstance(sid, str) or not isinstance(completed, dict):
+        raise ScanSafetyError("Previous campaign checkpoint is malformed")
+    if not completed:
+        return
+    ledger = load_ledger(ledger_path)
+    for symbol, row in completed.items():
+        item = ledger["entries"].get(symbol)
+        if (
+            not isinstance(row, dict)
+            or not isinstance(item, dict)
+            or item.get("source_session_id") != sid
+            or item.get("row_sha256") != _digest(row)
+        ):
+            raise ScanSafetyError(
+                f"Previous campaign has unrecorded completed research: {symbol}. "
+                "Run campaign_scan.py record against the existing checkpoint BEFORE "
+                "preparing another plan or using batch_scan.py --new-run."
+            )
+
+
+def prepare_day(project_root: Path, ledger_path: Path, report_path: Path, queue_path: Path,
+                csv_path: Path, output_root: Path, *, now: Optional[datetime] = None) -> Dict:
+    """Create a uniquely named current-day queue excluding archived completed work.
+
+    Never modifies the original pre-filter report/queue or batch checkpoint.
+    Does not assert historical WATCH/CANDIDATE status remains valid today.
+    """
+    now = now or ist_now()
+    project_root, output_root = Path(project_root), Path(output_root)
+    verify_previous_campaign_checkpoint(
+        ledger_path, output_root.parent / "larger_scan" / "current_state.json", output_root,
+    )
+    ledger = load_ledger(ledger_path)
+    inputs = load_inputs(project_root, Path(queue_path), Path(report_path), Path(csv_path), now=now)
+    source = _read(report_path)
+    if source.get("skip_review") is not True:
+        raise ScanSafetyError("Use prefilter_scan.py --skip-review for a campaign day")
+    if any(row.get("status") != "ELIGIBLE_FOR_DEEP_SCAN" for row in source.get("rows", []) if row.get("symbol") in inputs["symbols"]):
+        raise ScanSafetyError("Campaign source queue must contain only eligible rows")
+    historical = set(ledger["entries"])
+    remaining = [s for s in inputs["symbols"] if s not in historical]
+    plan_path = output_root / "current_plan.json"
+    if not remaining:
+        plan_path.unlink(missing_ok=True)  # prevent reuse of an older nonempty plan
+        return {"date_ist": inputs["date_ist"], "pending": 0, "historical": len(historical), "report": None, "queue": None}
+    folder = output_root / "daily" / inputs["date_ist"] / (now.strftime("%H%M%S") + "_" + uuid4().hex[:8])
+    folder.mkdir(parents=True, exist_ok=False)
+    output = dict(source)
+    output["selected_symbols"] = remaining
+    output["campaign_provenance"] = {"historical_only": True, "source_date_ist": inputs["date_ist"],
+                                      "source_report_sha256": inputs["hashes"]["report"],
+                                      "source_queue_sha256": inputs["hashes"]["queue"],
+                                      "campaign_ledger_sha256": _hash_file(ledger_path) if Path(ledger_path).is_file() else None,
+                                      "excluded_historical_count": len(inputs["symbols"]) - len(remaining),
+                                      "note": "Archived results are past research, never current-day CANDIDATE evidence."}
+    target_report, target_queue = folder / "prefilter_report.json", folder / "prefilter_selected_symbols.txt"
+    _write(target_report, output)
+    target_queue.write_text("\n".join(remaining) + "\n", encoding="utf-8")
+    # Prove the generated pair is accepted by the existing same-day scanner.
+    load_inputs(project_root, target_queue, target_report, Path(csv_path), now=now)
+    _write(plan_path, {"date_ist": inputs["date_ist"], "created_at_ist": now.isoformat(),
+                       "report": str(target_report.resolve()), "queue": str(target_queue.resolve()),
+                       "pending": len(remaining), "historical_only": True})
+    return {"date_ist": inputs["date_ist"], "pending": len(remaining), "historical": len(historical),
+            "report": str(target_report.resolve()), "queue": str(target_queue.resolve()),
+            "excluded_historical": len(inputs["symbols"]) - len(remaining)}
+
+
+def historical_summary(ledger_path: Path) -> Dict:
+    ledger = load_ledger(ledger_path)
+    return {"historical_records": len(ledger["entries"]), "daily_sessions": len(ledger["sessions"]),
+            "historical_decision_counts": dict(Counter(x["decision_at_scan"] for x in ledger["entries"].values())),
+            "note": "Historical research only. Do not present prior-session CANDIDATE as a current signal."}

@@ -349,6 +349,17 @@ def main() -> None:
                 "quality"
             ]
 
+            # The provider's observed-span ratio can be 100% even if Groww
+            # returned only the tail of the requested 15m lookback. Use real
+            # Daily trading dates to prevent that from permitting CANDIDATE.
+            from market_data.setup_history_gate import apply_requested_setup_history_gate
+            apply_requested_setup_history_gate(
+                quality,
+                daily=market["daily"],
+                setup_75m=market["setup_75m"],
+                requested_days=DEFAULT_SETUP_15M_DAYS,
+            )
+
             print(
                 f"{symbol}: market-data quality "
                 f"valid={quality['valid']} | "

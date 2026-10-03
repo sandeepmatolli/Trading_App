@@ -34,6 +34,15 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     root = PROJECT_ROOT / "data" / "output" / "larger_scan"
     try:
+        if args.new_run:
+            # Never overwrite the only live pointer to a campaign checkpoint
+            # before its completed results are independently recorded.
+            from screening.campaign import verify_previous_campaign_checkpoint
+            verify_previous_campaign_checkpoint(
+                OUTPUT_DIR / "campaign" / "campaign.json",
+                root / "current_state.json",
+                OUTPUT_DIR / "campaign",
+            )
         inputs = load_inputs(PROJECT_ROOT, args.queue.resolve(), args.report.resolve(),
                              args.csv.resolve(), now=ist_now())
         outcome = run_session(
