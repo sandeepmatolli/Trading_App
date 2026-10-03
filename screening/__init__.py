@@ -1,0 +1,1 @@
+"""Conservative, deterministic cheap pre-filter for NSE swing research."""
