@@ -29,9 +29,32 @@ VALID_PREFILTER = {"ELIGIBLE_FOR_DEEP_SCAN", "REVIEW_REQUIRED"}
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9&._-]{0,29}$")
 # A changed strategy/source engine must not silently mix output with old state.
 CODE_FILES = (
-    "batch_scan.py", "screening/batch_runner.py", "screening/pre_filter.py",
-    "ai/ai_validation.py", "main.py", "config.py", "news/news_engine.py",
-    "news/persistent_sources.py", "market_data/groww_fetch.py",
+    # Complete first-party research code, including helpers transitively used
+    # by main.py. Exclude local secrets and generated data; code edits may not
+    # silently mix previously checkpointed results with a different engine.
+    "batch_scan.py",
+    "prefilter_scan.py",
+    "requirements.txt",
+    "config.py",
+    "main.py",
+    "ai/ai_validation.py",
+    "fundamentals/csv_validator.py",
+    "fundamentals/master_builder.py",
+    "fundamentals/screener_symbols.py",
+    "screening/__init__.py",
+    "screening/batch_runner.py",
+    "screening/pre_filter.py",
+    "market_data/corporate_action_adjustment.py",
+    "market_data/groww_auth.py",
+    "market_data/groww_fetch.py",
+    "news/cache_db.py",
+    "news/corporate_action_cache.py",
+    "news/corporate_action_reconciliation.py",
+    "news/event_cache.py",
+    "news/news_engine.py",
+    "news/nse_historical_corporate_actions.py",
+    "news/persistent_sources.py",
+    "news/retry_utils.py",
     "technical/smc_engine.py",
 )
 
@@ -124,6 +147,29 @@ def load_inputs(project_root: Path, queue: Path, report: Path, csv: Path,
     return {"date_ist": today, "symbols": queue_symbols, "hashes": hashes,
             "csv_path": str(csv.resolve()), "queue_path": str(queue.resolve()),
             "report_path": str(report.resolve())}
+
+
+def verify_input_integrity(project_root: Path, inputs: Dict) -> None:
+    """Recheck the original snapshot before each child launch.
+
+    load_inputs() checks hashes at startup and a resume checks checkpoint
+    metadata. A single invocation can launch multiple batches, so check again
+    after every cooldown to avoid silently mixing different code, CSV or
+    pre-filter contents if an operator edits a file while the scan is running.
+    """
+    hashes = inputs["hashes"]
+    for key, path_key in (
+        ("queue", "queue_path"),
+        ("report", "report_path"),
+        ("csv", "csv_path"),
+    ):
+        if _hash_file(Path(inputs[path_key])) != hashes[key]:
+            raise ScanSafetyError(f"Snapshot changed during active scan: {key}")
+    if set(hashes["code"]) != set(CODE_FILES):
+        raise ScanSafetyError("Code fingerprint coverage differs from this runner")
+    for name in CODE_FILES:
+        if _hash_file(Path(project_root) / name) != hashes["code"][name]:
+            raise ScanSafetyError(f"Code changed during active scan: {name}")
 
 
 def create_or_resume_state(state_path: Path, session_root: Path, inputs: Dict,
@@ -258,6 +304,11 @@ def run_session(project_root: Path, state_path: Path, session_root: Path,
                 if now_fn().astimezone(IST).date().isoformat() != state["date_ist"]:
                     error = "IST date rolled over during cooldown. Regenerate the pre-filter."
                     break
+            try:
+                verify_input_integrity(project_root, inputs)
+            except ScanSafetyError as exc:
+                error = str(exc)
+                break
             state["attempt_sequence"] += 1
             num = state["attempt_sequence"]
             attempt_dir = root / f"batch_{num:04d}"
