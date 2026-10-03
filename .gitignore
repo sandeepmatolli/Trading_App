@@ -31,6 +31,9 @@ stocks_screen.csv
 all-stocks*.csv
 query-results*.csv
 
+# Local recovery copies are not production modules
+*.before-import-repair.bak
+
 # IDE / OS
 .vscode/
 .idea/
